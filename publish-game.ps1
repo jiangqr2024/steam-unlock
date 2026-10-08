@@ -21,7 +21,8 @@ param(
     [string]$Owner = 'jiangqr2024',
     [string]$Repo = 'steam-unlock',
     [string]$OutDir,
-    [switch]$NoUpload
+    [switch]$NoUpload,
+    [switch]$UseGithubIo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,7 +53,13 @@ $MIRRORS = @(
 )
 
 if (-not $OutDir) { $OutDir = Join-Path $PSScriptRoot 'g' }
-$PAGES = "https://$Owner.github.io/$Repo"
+# 优先使用自有域名（证书已于 2026-10-08 签发，有效期至 2027-01-06）。
+# 可用 -UseGithubIo 回退到 Pages 默认域名。
+if ($UseGithubIo) {
+    $PAGES = "https://$Owner.github.io/$Repo"
+} else {
+    $PAGES = "https://jiangqr2026.xyz"
+}
 
 function Say  ($m) { Write-Host "[*] $m" }
 function Ok   ($m) { Write-Host "[+] $m" -ForegroundColor Green }
