@@ -286,6 +286,33 @@ function Get-DepotKeys([int]$id, $needDepots) {
             }
         } catch { }
     }
+    # 兜底：SteamAutoCracks/ManifestHub 的 depotkeys.json 是 depotId -> key 的
+    # 全局映射表（实测 288381 条），覆盖面远超任何单仓库。代价是 16 MB，
+    # 所以只在前面所有镜像仍未能凑齐时下载一次。
+    if ($needDepots -and @($needDepots).Count -gt 0) {
+        $stillMissing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
+        if ($stillMissing.Count -gt 0) {
+            Write-Host ("[*]   仍有 {0} 个 depot 缺密钥，尝试全局密钥表 ..." -f $stillMissing.Count)
+            try {
+                $globalUrl = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'
+                $gj = Invoke-RestMethod -Uri $globalUrl -TimeoutSec 120 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+                $gained = 0
+                foreach ($d in $stillMissing) {
+                    $prop = $gj.PSObject.Properties | Where-Object { $_.Name -eq [string]$d.Id }
+                    if ($prop) {
+                        $v = [string]$prop.Value
+                        # 全局表里有空值条目，必须校验格式
+                        if ($v -match '^[0-9a-fA-F]{64}$') {
+                            $all[[string]$d.Id] = $v.ToLower()
+                            $gained++
+                        }
+                    }
+                }
+                if ($gained -gt 0) { [void]$srcs.Add("SteamAutoCracks/ManifestHub/depotkeys.json (+$gained)") }
+            } catch { }
+        }
+    }
+
     if ($all.Count -eq 0) { return $null }
     return [pscustomobject]@{ Keys = $all; Sources = $srcs }
 }
