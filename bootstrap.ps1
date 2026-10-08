@@ -82,8 +82,11 @@ Write-Host ''
 Write-Host 'Executing installer ...' -ForegroundColor Cyan
 Write-Host ''
 
-# 用 iex 执行而非 & $script：
-# 调用运算符受 ExecutionPolicy 约束，新装的 Windows 默认 Restricted（客户端系统），
-# 即使是 RemoteSigned，从网络下载的脚本也会因 Mark-of-the-Web 被拦下。
-# iex 执行的是字符串，不受该策略限制。实测 Restricted 下 & 失败、iex 成功。
+# Run via iex rather than the call operator "& $script":
+# the call operator IS subject to ExecutionPolicy. Fresh Windows client installs
+# default to Restricted, and even under RemoteSigned a script downloaded from the
+# internet carries Mark-of-the-Web and gets blocked. iex runs a string, so it is
+# unaffected. Verified: under Restricted, & fails and iex succeeds.
+# NOTE: this file must stay pure ASCII with no BOM, because it is fed to iex by
+# PowerShell 5.1, which would decode non-ASCII bytes using the ANSI code page.
 iex (Get-Content $DST -Raw)
