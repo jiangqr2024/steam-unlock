@@ -61,13 +61,27 @@ Write-Host ''
 # ── 1. 游戏信息 ───────────────────────────────────────────────
 Say '查询商店信息 ...'
 $appName = '(unknown)'
+$drmNotice = ''
 try {
     $j = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$AppId&l=schinese" -TimeoutSec 30 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
     $d = $j."$AppId"
-    if ($d -and $d.success) { $appName = $d.data.name }
+    if ($d -and $d.success) {
+        $appName = $d.data.name
+        $drmNotice = [string]$d.data.drm_notice
+    }
 }
 catch { Warn "商店接口失败: $($_.Exception.Message)" }
 Ok "游戏名: $appName"
+
+$hasDenuvo = $false
+if ($drmNotice) {
+    $hasDenuvo = $drmNotice -match '(?i)denuvo'
+    Warn ('DRM 说明: ' + ($drmNotice -replace '<br\s*/?>', ' / '))
+    if ($hasDenuvo) {
+        Warn '该游戏使用 Denuvo Anti-Tamper —— 即使成功入库，启动时仍会被服务端授权校验拦下。'
+        Warn '需要额外配置 setAppTicket / setETicket，而票据必须来自真正拥有该游戏的账号。'
+    }
+}
 
 # ── 2. depot 结构 ─────────────────────────────────────────────
 Say '解析 depot 结构 ...'
@@ -199,6 +213,13 @@ else {
             $verdict = '缺失项不影响'
         }
     }
+}
+
+# Denuvo 是比密钥覆盖率更硬的门槛：密钥缺了还有办法补，Denuvo 没有票据就是跑不起来
+if ($hasDenuvo) {
+    Write-Host ''
+    Warn '最终判定: 受 Denuvo 保护，本方案无法使其可运行（与密钥覆盖率无关）'
+    $verdict = 'Denuvo 保护，无法运行'
 }
 
 # ── 5. 生成 g\<appid>.ps1（纯 ASCII 无 BOM）──────────────────
