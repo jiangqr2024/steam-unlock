@@ -11,14 +11,14 @@
 #  It does NOT use packed / encrypted / memory-loaded payloads.
 #  The only remote fetch is install.ps1 from the fixed URLs below.
 #
-#  Setup: replace  <USER>  and  <REPO>  with your own GitHub repo.
+#  Setup: replace  jiangqr2024  and  steam-unlock  with your own GitHub repo.
 #  Usage: irm <RAW_URL_OF_THIS_FILE> | iex
 # ============================================================
 
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
-$RAW = 'https://raw.githubusercontent.com/<USER>/<REPO>/main/install.ps1'
+$RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
 
 # Mirror order: direct raw first (fastest when reachable), then GitHub
 # proxies, then jsDelivr CDN as the last resort for networks where
@@ -29,8 +29,8 @@ $SRCS = @(
     $RAW,
     'https://gh-proxy.com/' + $RAW,
     'https://ghproxy.net/' + $RAW,
-    'https://cdn.jsdelivr.net/gh/<USER>/<REPO>@main/install.ps1',
-    'https://fastly.jsdelivr.net/gh/<USER>/<REPO>@main/install.ps1'
+    'https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/install.ps1',
+    'https://fastly.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/install.ps1'
 )
 
 $DST = Join-Path $env:TEMP 'ost-install.ps1'
