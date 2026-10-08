@@ -82,4 +82,8 @@ Write-Host ''
 Write-Host 'Executing installer ...' -ForegroundColor Cyan
 Write-Host ''
 
-& $DST
+# 用 iex 执行而非 & $script：
+# 调用运算符受 ExecutionPolicy 约束，新装的 Windows 默认 Restricted（客户端系统），
+# 即使是 RemoteSigned，从网络下载的脚本也会因 Mark-of-the-Web 被拦下。
+# iex 执行的是字符串，不受该策略限制。实测 Restricted 下 & 失败、iex 成功。
+iex (Get-Content $DST -Raw)
