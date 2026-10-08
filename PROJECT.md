@@ -156,9 +156,10 @@ public appinfo **不含密钥**，只有 manifest 的 gid。
 
 ```powershell
 foreach ($m in $MIRRORS) {
-    GET https://raw.githubusercontent.com/<m>/<appid>/Key.vdf
+    # 各仓库文件名大小写不一致：bruh-hub 用 key.vdf，其余多为 Key.vdf
+    foreach ($fn in @('key.vdf', 'Key.vdf', 'config.vdf')) { 尝试拉取 }
     正则匹配 '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"'
-    长度必须 == 64，否则跳过（加密格式）
+    长度必须 == 64，否则跳过（哈希/加密格式）
     取并集，已覆盖全部 depot 则提前 break
 }
 ```
@@ -169,9 +170,63 @@ foreach ($m in $MIRRORS) {
 |---|---|---|
 | 巫师 3 | Auiowu 35 / TOP-01 18 | **53 / 53** |
 | 赛博朋克 2077 | TOP-01 12 / Auiowu 12 | **24 / 24** |
-| 只狼 | TOP-01 5 / Auiowu 4 | **5 / 6** |
+| 生化危机 4 | 旧列表 2 / 31（不可行） | **31 / 31**（bruh-hub 一个源补齐） |
 
-**为什么过滤非 64 位密钥**：`repositories.json` 里标为 `Encrypted` 的仓库（`sean-who`、`Fairyvmos`、`Scropiouos_PrivateBackUp`）其 `DecryptionKey` 值是 **76+ 字符的加密格式**，而 OpenSteamTool 实现里要求 `strlen(key) == 64`，不符合的直接丢弃。早期版本把这些仓库排在最前，且正则写死 `{64}`，导致**一条都匹配不到却毫无提示**。
+### 3.3.1 关于 64 字符限制（源码级确认）
+
+`src/Utils/Config/LuaConfig.cpp` 的 `lua_addappid` 实现：
+
+```cpp
+    std::string Key = "";
+    if (argc > 2) {
+        if (!lua_isstring(L, 3)) return luaL_error(L, "");
+        const char* key = lua_tostring(L, 3);
+        // Keep only keys with exactly 64 characters.
+        if (strlen(key) == 64) {
+            Key = std::string(key);
+        }
+    }
+    if (!Key.empty() || !DepotKeySet.count(DepotId)) {
+        DepotKeySet[DepotId] = Key;
+    }
+```
+
+**恰好 64，不是 64 就静默丢弃**——注意这里**没有 `luaL_error`**，所以 DLL 里也没有 `addappid` 的校验消息串（对比 `setETicket` / `setStat` 都有成套提示），排查时容易误以为"没有校验"。
+
+### 3.3.2 三类仓库的本质区别
+
+SDO 的 README 给出了权威定义：
+
+| 类型 | 密钥 | manifest | 说明 |
+|---|---|---|---|
+| **Decrypted** | 64 字符有效 ✓ | 可能旧 | 传统主力来源 |
+| **Encrypted** | **128/192 字符，hashed/partial/invalid ✗** | 最新 ✓ | 密钥不可用 |
+| **Branch** | **64 字符有效 ✓** | **实际 .manifest 数据 ✓** | **最优，此前被误判跳过** |
+
+SDO 原文对 Encrypted 的说明：
+> decryption keys within their `key.vdf`/`config.vdf` might be **hashed, partial, or invalid**... Games downloaded solely from here **likely won't work directly** ("Content is still encrypted" error).
+
+**关键教训**：`Branch` 只是 SDO 对「下载打包 zip」这种分发方式的分类，**不代表资源不可用**。`Fairyvmos/bruh-hub` 被归为 Branch，但它实际提供：
+
+```
+<appid>/key.vdf      标准 64 字符密钥（实测 5/5 与已知明文一致）
+<appid>/<appid>.lua  现成的 lua 配置
+<appid>/<appid>.json 含 decryptionkey + gid + size 的完整元数据
+<appid>/<depot>_<gid>.manifest  实际 manifest 数据
+```
+
+**规模对比（实测）**：
+
+| 仓库 | 分支数 | 密钥有效性 |
+|---|---|---|
+| **Fairyvmos/bruh-hub** | **40461** | **✓ 抽样 5/5 有效** |
+| sean-who/ManifestAutoUpdate | 27795 | ✗ 128 字符哈希 |
+| Fairyvmos/BlankTMing | 29470 | ✗ 192 字符哈希 |
+| 11 个 Decrypted 仓库并集 | 8323 | ✓ 有效 |
+
+**一个 bruh-hub ≈ 旧方案全量并集的 4.9 倍，且质量更高。**
+
+**为何最初会漏掉它**：分支名是纯数字 AppID，但按字母序排序后 `10`/`20`/`1000000` 这些短数字排在前面，`814380` 这类 6 位 AppID 要翻很多页才出现，第一眼容易被误判为"分支名是随机串"。
 
 **lua 生成**
 
@@ -291,10 +346,17 @@ hansaes             +450   = 8323
 |---|---|---|---|
 | 巫师 3 | 292030 | **53 / 53** | 完整 |
 | 赛博朋克 2077 | 1091500 | **24 / 24** | 完整 |
+| 尼尔：机械纪元 | 524220 | **9 / 9** | 完整 |
+| 生化危机 4 | 2050650 | **31 / 31** | 完整（bruh-hub 一个源补齐，旧方案仅 2/31） |
 | 只狼 | 814380 | 5 / 6 | 缺 512B 空占位，已实测可玩 |
-| 艾尔登法环 | 1245620 | 4 / 8 | 本体 51.26GB 可用，**黄金树幽影 15.02GB 缺密钥** |
+| 艾尔登法环 | 1245620 | 4 / 8 | 本体 51.26GB 可用，**黄金树幽影 15.02GB 全 26 库均无** |
+| 控制 终极合辑 | 870780 | 4 / 5 | 最大的 42.73GB depot 缺密钥 |
 | 剑星 | 3489700 | 0 / 3 | Denuvo + 新作，不可行 |
 | 黑神话悟空 | 2358720 | 1 / ? | Denuvo，不可行 |
+
+**已实测入库成功的游戏**：只狼、赛博朋克 2077、巫师 3、艾尔登法环、尼尔：机械纪元。
+
+**主流 3A 筛查结论**（25 款抽样）：仅「死亡空间」有 Denuvo；「生化危机 4 / 控制」在加入 bruh-hub 后前者转为完整、后者仍缺主内容；其余 22 款均为「完整」或「主内容可用」。
 
 ### 6.3 不可行的两类
 
