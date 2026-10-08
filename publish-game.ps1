@@ -151,6 +151,31 @@ foreach ($m in $MIRRORS) {
     }
     catch { [void]$keySrcs.Add("$m  ERR: " + $_.Exception.Message.Split([char]10)[0]) }
 }
+
+# 兜底：全局密钥表 depotId -> key（实测 288381 条），覆盖面远超单仓库。
+# 含空值条目，必须校验格式后再采用。
+if ($depots.Count -gt 0) {
+    $stillMissing = @($depots | Where-Object { -not $allKeys.ContainsKey([string]$_.Id) })
+    if ($stillMissing.Count -gt 0) {
+        Write-Host ("[*]   仍有 {0} 个 depot 缺密钥，查全局密钥表 ..." -f $stillMissing.Count)
+        try {
+            $gj = Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json' -TimeoutSec 120 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+            $gained = 0
+            foreach ($d in $stillMissing) {
+                $prop = $gj.PSObject.Properties | Where-Object { $_.Name -eq [string]$d.Id }
+                if ($prop) {
+                    $v = [string]$prop.Value
+                    if ($v -match '^[0-9a-fA-F]{64}$') {
+                        $allKeys[[string]$d.Id] = $v.ToLower()
+                        $gained++
+                    }
+                }
+            }
+            if ($gained -gt 0) { [void]$keySrcs.Add("SteamAutoCracks/ManifestHub (+$gained)") }
+        } catch { }
+    }
+}
+
 if ($allKeys.Count -gt 0) {
     $keyInfo = [pscustomobject]@{ Keys = $allKeys; Sources = $keySrcs }
 }
