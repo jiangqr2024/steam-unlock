@@ -27,16 +27,26 @@ param(
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
-# 只收录明文标准格式（64 位十六进制）密钥的仓库。标为 "Encrypted" 的仓库
-# （sean-who / Fairyvmos）其 Key.vdf 内是 76+ 字符的加密格式，工具不接受。
+# 只收录密钥为明文标准格式（恰好 64 位十六进制）的仓库。
+# 标为 "Encrypted" 的仓库（sean-who / Fairyvmos/BlankTMing 等）其 Key.vdf 内是
+# 128/192 字符的哈希或加密格式，OpenSteamTool 的 lua_addappid 有硬编码校验
+# "if (strlen(key) == 64)"，不满足者被静默丢弃（见 LuaConfig.cpp）。
+#
+# Fairyvmos/bruh-hub 是当前最优来源：40461 个 AppID 分支，密钥抽样全部有效，
+# 且额外提供 .lua / .json / .manifest。注意它的文件名是【小写】key.vdf，
+# 与下面其他仓库的【大写】Key.vdf 不同，脚本会同时尝试两种拼法。
 $MIRRORS = @(
+    'Fairyvmos/bruh-hub',
     'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
+    'hansaes/ManifestAutoUpdate',
+    '1271620983/ManifestAutoUpdate',
     'MineRPG/ManifestAutoUpdate',
     'bingyu50/ManifestAutoUpdate',
-    '1271620983/ManifestAutoUpdate',
-    'hansaes/ManifestAutoUpdate',
+    'ManifestHub/ManifestHub',
+    'Scropiouos/ManifestAutoUpdate_backup',
+    'luomojim/ManifestAutoUpdate',
     'crazzzzzysnail/ManifestAutoUpdate_fork'
 )
 
@@ -110,11 +120,20 @@ $keyInfo = $null
 $allKeys = @{}
 $keySrcs = New-Object System.Collections.Generic.List[string]
 foreach ($m in $MIRRORS) {
+    # 各仓库文件名大小写不一致：bruh-hub 用 key.vdf，其余多用 Key.vdf，另有 config.vdf
+    $resp = $null
+    foreach ($fn in @('key.vdf', 'Key.vdf', 'config.vdf')) {
+        try {
+            $resp = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$AppId/$fn" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+            break
+        } catch { }
+    }
+    if ($null -eq $resp) { continue }
+
     try {
-        $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$AppId/Key.vdf" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
         $added = 0
         $skipped = 0
-        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
+        foreach ($mm in [regex]::Matches($resp.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
             $k = $mm.Groups[1].Value
             $v = $mm.Groups[2].Value
             if ($v.Length -ne 64) { $skipped++; continue }
@@ -124,7 +143,7 @@ foreach ($m in $MIRRORS) {
             }
         }
         if ($added -gt 0) { [void]$keySrcs.Add("$m (+$added)") }
-        elseif ($skipped -gt 0) { [void]$keySrcs.Add("$m (加密格式 $skipped 个，已跳过)") }
+        elseif ($skipped -gt 0) { [void]$keySrcs.Add("$m (哈希格式 $skipped 个，已跳过)") }
         if ($depots.Count -gt 0) {
             $missingNow = @($depots | Where-Object { -not $allKeys.ContainsKey([string]$_.Id) })
             if ($missingNow.Count -eq 0) { break }
