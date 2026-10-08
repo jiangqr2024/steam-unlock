@@ -42,16 +42,20 @@ $DLL_SHA = [ordered]@{
     'OpenSteamTool.dll' = 'B2ED24E0B4E2D0DAE4CAA8817ED4C0C34AF8FDF056F356FD697AE1356EA22581'
 }
 
-# depot 密钥清单库镜像，按顺序尝试（均为 GitHub 公开仓库）
+# depot 密钥清单库镜像。
+# 只收录密钥为明文标准格式（恰好 64 个十六进制字符）的仓库。标为 "Encrypted"
+# 的仓库（sean-who / Fairyvmos / Scropiouos_PrivateBackUp）其 Key.vdf 内是加密
+# 格式（76+ 字符），OpenSteamTool 要求 strlen(key)==64，取来也会被丢弃。
+# 按实测覆盖率排序：TOP-01 只狼 5/5，Auiowu / tymolu233 为 4/5。
+# 脚本会遍历多个镜像取并集，不同仓库收录的 depot 并不一致。
 $MIRRORS = @(
+    'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
     'MineRPG/ManifestAutoUpdate',
     'bingyu50/ManifestAutoUpdate',
-    'TOP-01/ManifestAutoUpdate',
     '1271620983/ManifestAutoUpdate',
     'hansaes/ManifestAutoUpdate',
-    'luomojim/ManifestAutoUpdate',
     'crazzzzzysnail/ManifestAutoUpdate_fork'
 )
 
@@ -236,22 +240,39 @@ function Get-DepotPlan([int]$id) {
     return $list
 }
 
-function Get-DepotKeys([int]$id) {
+function Get-DepotKeys([int]$id, $needDepots) {
+    # 遍历多个镜像取并集：各仓库收录的 depot 并不一致，单个仓库常缺关键密钥。
+    # 一旦 appinfo 里列出的 depot 全部有密钥就提前停止，避免无谓请求。
+    $all = @{}
+    $srcs = New-Object System.Collections.Generic.List[string]
     foreach ($m in $MIRRORS) {
         $u = "https://raw.githubusercontent.com/$m/$id/Key.vdf"
         try {
-            $r = Invoke-WebRequest -Uri $u -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+            $r = Invoke-WebRequest -Uri $u -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
         } catch { continue }
 
-        $keys = @{}
-        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]{64})"')) {
-            $keys[$mm.Groups[1].Value] = $mm.Groups[2].Value
+        $added = 0
+        $skipped = 0
+        # 正则放宽到任意长度再按长度过滤：加密格式的仓库必须被识别并报告，而不是静默丢弃
+        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
+            $k = $mm.Groups[1].Value
+            $v = $mm.Groups[2].Value
+            if ($v.Length -ne 64) { $skipped++; continue }
+            if (-not $all.ContainsKey($k)) {
+                $all[$k] = $v
+                $added++
+            }
         }
-        if ($keys.Count -gt 0) {
-            return [pscustomobject]@{ Source = $m; Keys = $keys }
+        if ($added -gt 0) { [void]$srcs.Add("$m (+$added)") }
+        elseif ($skipped -gt 0) { [void]$srcs.Add("$m (加密格式 $skipped 个，已跳过)") }
+
+        if ($needDepots -and @($needDepots).Count -gt 0) {
+            $missing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
+            if ($missing.Count -eq 0) { break }
         }
     }
-    return $null
+    if ($all.Count -eq 0) { return $null }
+    return [pscustomobject]@{ Keys = $all; Sources = $srcs }
 }
 
 function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp) {
@@ -400,9 +421,10 @@ if ($depots.Count -eq 0) {
 
 Write-Host ''
 Say '获取 depot 解密密钥 ...'
-$keyInfo = Get-DepotKeys $AppId
+$keyInfo = Get-DepotKeys $AppId $depots
 if ($keyInfo) {
-    Ok "命中镜像 $($keyInfo.Source)，共 $($keyInfo.Keys.Count) 个密钥"
+    Ok "共取到 $($keyInfo.Keys.Count) 个 depot 密钥，来源："
+    foreach ($s in $keyInfo.Sources) { Say "    $s" }
 } else {
     Warn '所有镜像均无该 appid 的 Key.vdf，将不写密钥（下载可能失败，属该游戏未被收录）'
 }
