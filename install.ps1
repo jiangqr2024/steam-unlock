@@ -318,7 +318,7 @@ function Get-DepotKeys([int]$id, $needDepots) {
     return [pscustomobject]@{ Keys = $all; Sources = $srcs }
 }
 
-function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp) {
+function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $extraApps) {
     $luaDir = Join-Path $root 'config\lua'
     New-Item -ItemType Directory -Force -Path $luaDir | Out-Null
 
@@ -328,7 +328,18 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp) {
     [void]$sb.AppendLine("-- 生成时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
     [void]$sb.AppendLine('-- 语法: addappid(参数1=depotId, 参数2=被实现忽略, 参数3=64位解密密钥)')
     [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('-- 本体')
     [void]$sb.AppendLine("addappid($id)")
+
+    # DLC 的 appid 必须显式声明。否则 Steam 不认为你拥有该 DLC——
+    # 即使其 depot 密钥已在下方列出，对应内容也不会被下载。
+    if ($extraApps -and @($extraApps).Count -gt 0) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine("-- DLC（共 $(@($extraApps).Count) 个）")
+        foreach ($ea in $extraApps) {
+            [void]$sb.AppendLine("addappid($ea)")
+        }
+    }
 
     $withKey = 0
     $noKey = 0
@@ -461,6 +472,30 @@ Write-Config $steam $stamp | Out-Null
 Write-Host ''
 Say '解析 depot 结构 ...'
 $depots = Get-DepotPlan $AppId
+
+# 收集 DLC。DLC 的 appid 必须显式 addappid，否则 Steam 不认为你拥有它；
+# 而其 depot 有时挂在本体下、有时独立，两种都要覆盖。
+$dlcIds = @()
+try {
+    $sd = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$AppId&l=schinese" -TimeoutSec 30 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+    $sdApp = $sd."$AppId"
+    if ($sdApp -and $sdApp.success -and $sdApp.data.dlc) { $dlcIds = @($sdApp.data.dlc) }
+} catch { }
+if ($dlcIds.Count -gt 0) {
+    Say "检测到 $($dlcIds.Count) 个 DLC，纳入其 app 声明与独立 depot ..."
+    foreach ($dlcId in $dlcIds) {
+        $dlcDepots = Get-DepotPlan ([int]$dlcId)
+        $added = 0
+        foreach ($d in $dlcDepots) {
+            if (-not ($depots | Where-Object { "$($_.Id)" -eq "$($d.Id)" })) {
+                $depots += $d
+                $added++
+            }
+        }
+        Say "    DLC $dlcId : 独立 depot $($dlcDepots.Count) 个（新增 $added）"
+    }
+}
+
 if ($depots.Count -eq 0) {
     Warn '未能解析出 depot 列表，将只写入 addappid(本体)，由工具自行向上游索取清单'
 }
@@ -468,6 +503,24 @@ if ($depots.Count -eq 0) {
 Write-Host ''
 Say '获取 depot 解密密钥 ...'
 $keyInfo = Get-DepotKeys $AppId $depots
+
+# DLC 若带独立 depot，其密钥可能在 DLC 自己的分支下，逐个补取
+if ($dlcIds.Count -gt 0) {
+    foreach ($dlcId in $dlcIds) {
+        $dlcDepots2 = Get-DepotPlan ([int]$dlcId)
+        if ($dlcDepots2.Count -eq 0) { continue }
+        $dk = Get-DepotKeys ([int]$dlcId) $dlcDepots2
+        if (-not $dk) { continue }
+        if (-not $keyInfo) {
+            $keyInfo = [pscustomobject]@{ Keys = @{}; Sources = (New-Object System.Collections.Generic.List[string]) }
+        }
+        $gained = 0
+        foreach ($kk in $dk.Keys.Keys) {
+            if (-not $keyInfo.Keys.ContainsKey($kk)) { $keyInfo.Keys[$kk] = $dk.Keys[$kk]; $gained++ }
+        }
+        if ($gained -gt 0) { [void]$keyInfo.Sources.Add("DLC $dlcId (+$gained)") }
+    }
+}
 if ($keyInfo) {
     Ok "共取到 $($keyInfo.Keys.Count) 个 depot 密钥，来源："
     foreach ($s in $keyInfo.Sources) { Say "    $s" }
@@ -490,7 +543,7 @@ if ($keyInfo -and $depots.Count -gt 0) {
 }
 
 Write-Host ''
-Write-Lua $steam $AppId $plan $keyInfo $stamp | Out-Null
+Write-Lua $steam $AppId $plan $keyInfo $stamp $dlcIds | Out-Null
 
 Write-Host ''
 if ($NoRestart) {
