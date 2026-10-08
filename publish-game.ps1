@@ -37,6 +37,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 # 与下面其他仓库的【大写】Key.vdf 不同，脚本会同时尝试两种拼法。
 $MIRRORS = @(
     'Fairyvmos/bruh-hub',
+    'nekoaday/ManifestAutoUpdate',
     'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
