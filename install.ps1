@@ -53,6 +53,7 @@ $DLL_SHA = [ordered]@{
 # 【大写】Key.vdf 不同，下面会同时尝试两种拼法（以及 config.vdf）。
 $MIRRORS = @(
     'Fairyvmos/bruh-hub',
+    'nekoaday/ManifestAutoUpdate',
     'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
