@@ -27,15 +27,16 @@ param(
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
+# 只收录明文标准格式（64 位十六进制）密钥的仓库。标为 "Encrypted" 的仓库
+# （sean-who / Fairyvmos）其 Key.vdf 内是 76+ 字符的加密格式，工具不接受。
 $MIRRORS = @(
+    'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
     'MineRPG/ManifestAutoUpdate',
     'bingyu50/ManifestAutoUpdate',
-    'TOP-01/ManifestAutoUpdate',
     '1271620983/ManifestAutoUpdate',
     'hansaes/ManifestAutoUpdate',
-    'luomojim/ManifestAutoUpdate',
     'crazzzzzysnail/ManifestAutoUpdate_fork'
 )
 
@@ -92,19 +93,33 @@ Ok "带 public manifest 的 depot: $($depots.Count) 个"
 # ── 3. 密钥覆盖 ───────────────────────────────────────────────
 Say '检查清单库密钥覆盖 ...'
 $keyInfo = $null
+$allKeys = @{}
+$keySrcs = New-Object System.Collections.Generic.List[string]
 foreach ($m in $MIRRORS) {
     try {
-        $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$AppId/Key.vdf" -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
-        $keys = @{}
-        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]{64})"')) {
-            $keys[$mm.Groups[1].Value] = $mm.Groups[2].Value
+        $r = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$AppId/Key.vdf" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+        $added = 0
+        $skipped = 0
+        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
+            $k = $mm.Groups[1].Value
+            $v = $mm.Groups[2].Value
+            if ($v.Length -ne 64) { $skipped++; continue }
+            if (-not $allKeys.ContainsKey($k)) {
+                $allKeys[$k] = $v
+                $added++
+            }
         }
-        if ($keys.Count -gt 0) {
-            $keyInfo = [pscustomobject]@{ Source = $m; Keys = $keys }
-            break
+        if ($added -gt 0) { [void]$keySrcs.Add("$m (+$added)") }
+        elseif ($skipped -gt 0) { [void]$keySrcs.Add("$m (加密格式 $skipped 个，已跳过)") }
+        if ($depots.Count -gt 0) {
+            $missingNow = @($depots | Where-Object { -not $allKeys.ContainsKey([string]$_.Id) })
+            if ($missingNow.Count -eq 0) { break }
         }
     }
-    catch { }
+    catch { [void]$keySrcs.Add("$m  ERR: " + $_.Exception.Message.Split([char]10)[0]) }
+}
+if ($allKeys.Count -gt 0) {
+    $keyInfo = [pscustomobject]@{ Keys = $allKeys; Sources = $keySrcs }
 }
 
 # ── 4. 覆盖率诊断 ─────────────────────────────────────────────
@@ -125,7 +140,9 @@ if (-not $keyInfo) {
     $verdict = '清单库未收录'
 }
 else {
-    Ok "密钥来源: $($keyInfo.Source)"
+    Ok '密钥来源（多镜像并集）:'
+    foreach ($s in $keyInfo.Sources) { '       ' + $s }
+    Write-Host ''
     '   appinfo depot : ' + $depots.Count
     '   有密钥        : ' + $have.Count
     '   缺密钥        : ' + $miss.Count
