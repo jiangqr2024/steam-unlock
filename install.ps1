@@ -44,18 +44,25 @@ $DLL_SHA = [ordered]@{
 
 # depot 密钥清单库镜像。
 # 只收录密钥为明文标准格式（恰好 64 个十六进制字符）的仓库。标为 "Encrypted"
-# 的仓库（sean-who / Fairyvmos / Scropiouos_PrivateBackUp）其 Key.vdf 内是加密
-# 格式（76+ 字符），OpenSteamTool 要求 strlen(key)==64，取来也会被丢弃。
-# 按实测覆盖率排序：TOP-01 只狼 5/5，Auiowu / tymolu233 为 4/5。
-# 脚本会遍历多个镜像取并集，不同仓库收录的 depot 并不一致。
+# 的仓库（sean-who / Fairyvmos/BlankTMing）其 Key.vdf 内是 128/192 字符的哈希或
+# 加密格式，而 lua_addappid 有硬编码校验 "if (strlen(key) == 64)"（见
+# src/Utils/Config/LuaConfig.cpp），不满足者被静默丢弃。
+#
+# Fairyvmos/bruh-hub 是当前最优来源：40461 个 AppID 分支，抽样密钥全部有效，
+# 且额外提供 .lua / .json / .manifest。其文件名是【小写】key.vdf，与其余仓库的
+# 【大写】Key.vdf 不同，下面会同时尝试两种拼法（以及 config.vdf）。
 $MIRRORS = @(
+    'Fairyvmos/bruh-hub',
     'TOP-01/ManifestAutoUpdate',
     'Auiowu/ManifestAutoUpdate',
     'tymolu233/ManifestAutoUpdate',
+    'hansaes/ManifestAutoUpdate',
+    '1271620983/ManifestAutoUpdate',
     'MineRPG/ManifestAutoUpdate',
     'bingyu50/ManifestAutoUpdate',
-    '1271620983/ManifestAutoUpdate',
-    'hansaes/ManifestAutoUpdate',
+    'ManifestHub/ManifestHub',
+    'Scropiouos/ManifestAutoUpdate_backup',
+    'luomojim/ManifestAutoUpdate',
     'crazzzzzysnail/ManifestAutoUpdate_fork'
 )
 
@@ -247,30 +254,37 @@ function Get-DepotKeys([int]$id, $needDepots) {
     $all = @{}
     $srcs = New-Object System.Collections.Generic.List[string]
     foreach ($m in $MIRRORS) {
-        $u = "https://raw.githubusercontent.com/$m/$id/Key.vdf"
+        # 各仓库文件名大小写不一致（bruh-hub 用小写 key.vdf），逐个尝试
+        $resp = $null
+        foreach ($fn in @('key.vdf', 'Key.vdf', 'config.vdf')) {
+            try {
+                $resp = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$id/$fn" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+                break
+            } catch { }
+        }
+        if ($null -eq $resp) { continue }
+
         try {
-            $r = Invoke-WebRequest -Uri $u -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
-        } catch { continue }
-
-        $added = 0
-        $skipped = 0
-        # 正则放宽到任意长度再按长度过滤：加密格式的仓库必须被识别并报告，而不是静默丢弃
-        foreach ($mm in [regex]::Matches($r.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
-            $k = $mm.Groups[1].Value
-            $v = $mm.Groups[2].Value
-            if ($v.Length -ne 64) { $skipped++; continue }
-            if (-not $all.ContainsKey($k)) {
-                $all[$k] = $v
-                $added++
+            $added = 0
+            $skipped = 0
+            # 正则放宽到任意长度再按长度过滤：哈希格式的仓库必须被识别并报告，而不是静默丢弃
+            foreach ($mm in [regex]::Matches($resp.Content, '"(\d+)"\s*\{\s*"DecryptionKey"\s*"([0-9a-fA-F]+)"')) {
+                $k = $mm.Groups[1].Value
+                $v = $mm.Groups[2].Value
+                if ($v.Length -ne 64) { $skipped++; continue }
+                if (-not $all.ContainsKey($k)) {
+                    $all[$k] = $v
+                    $added++
+                }
             }
-        }
-        if ($added -gt 0) { [void]$srcs.Add("$m (+$added)") }
-        elseif ($skipped -gt 0) { [void]$srcs.Add("$m (加密格式 $skipped 个，已跳过)") }
+            if ($added -gt 0) { [void]$srcs.Add("$m (+$added)") }
+            elseif ($skipped -gt 0) { [void]$srcs.Add("$m (哈希格式 $skipped 个，已跳过)") }
 
-        if ($needDepots -and @($needDepots).Count -gt 0) {
-            $missing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
-            if ($missing.Count -eq 0) { break }
-        }
+            if ($needDepots -and @($needDepots).Count -gt 0) {
+                $missing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
+                if ($missing.Count -eq 0) { break }
+            }
+        } catch { }
     }
     if ($all.Count -eq 0) { return $null }
     return [pscustomobject]@{ Keys = $all; Sources = $srcs }
