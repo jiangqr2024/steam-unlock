@@ -193,7 +193,73 @@ foreach ($m in $MIRRORS) {
 
 **恰好 64，不是 64 就静默丢弃**——注意这里**没有 `luaL_error`**，所以 DLL 里也没有 `addappid` 的校验消息串（对比 `setETicket` / `setStat` 都有成套提示），排查时容易误以为"没有校验"。
 
-### 3.3.2 三类仓库的本质区别
+### 3.3.2 资源库全景（按内容实测，不信任分类标签）
+
+**教训**：SDO 的 `Encrypted` / `Decrypted` / `Branch` 标签**与实际可用性严重不符**，必须逐个实测。全量验证 26 个仓库的结果：
+
+| 实测结果 | 数量 | 说明 |
+|---|---|---|
+| 实际可用 | 13 | 密钥为 64 字符标准格式 |
+| 标 Decrypted 但取不到数据 | 6 | `ManifestHub/ManifestHub`、`ikun0014/ManifestHub`、`ltsj/*`、`bingyu50/SteamManifestCache`、`TOP-01/SteamManifestCache`、`Scropiouos/SteamManifestCache_backup` |
+| 标 Encrypted 但实际可用 | 1 | **`nekoaday/ManifestAutoUpdate`**（16562 分支，文件名 `config.vdf`） |
+| 标 Branch 但实际可用 | 1 | **`Fairyvmos/bruh-hub`**（40461 分支，文件名 `key.vdf`） |
+| 确认哈希/无效 | 3 | `sean-who`、`Fairyvmos/BlankTMing`、`Scropiouos/..._PrivateBackUp` |
+| 仓库已删除 | 5 | `japapalarox/*`、`ltsj/*`、`ikun0014/*`、`Fallonma/*`、`nekoaday/*_again` |
+
+**文件名的三种拼法**（这是取不到数据的主因）：
+
+| 文件名 | 使用的仓库 |
+|---|---|
+| `key.vdf`（小写） | `Fairyvmos/bruh-hub` |
+| `Key.vdf`（大写） | `Auiowu`、`TOP-01`、`tymolu233`、`sean-who` |
+| **`config.vdf`** | `nekoaday`、`hansaes`、`MineRPG`、`luomojim`、`1271620983`、`bingyu50`、`crazzzzzysnail`、`Scropiouos_backup` |
+
+**大多数仓库用的是 `config.vdf`，而不是 `key.vdf`——只试前者会漏掉近一半可用源。** 脚本现已三种都试。
+
+### 3.3.3 全局密钥表（覆盖面最大的一环）
+
+`SteamAutoCracks/ManifestHub` 的 **`depotkeys.json`** 是一个 **depotId → key 的全局映射表**：
+
+```
+文件大小   : 16,044,970 字节
+总条目     : 288,381
+有效条目   : 175,781（其余为空值，必须逐条校验格式后才能采用）
+```
+
+**这个表的覆盖面超过所有按 AppID 分目录的仓库之和**，因为它是扁平的 depot 级映射，不受"某个仓库收不收这个游戏"的限制。
+
+**接入策略**（兼顾速度与覆盖率）：先走 12 个镜像（快，秒级），**只有当仍有 depot 缺密钥时**才下载这 16 MB 全局表兜底。
+
+**实测效果——艾尔登法环「全 DLC」从不可能变为可行**：
+
+```
+接入前: 4 / 8  depot，缺 黄金树幽影(2778580, 15.02GB) + 典藏包(2855520, 1.01GB) + 2 个小 depot
+接入后: 7 / 8  depot，有密钥 69.20 GB
+
+[有] depot 1245621   51.26 GB
+[缺] depot 1245622    0.91 GB     ← 全局表里这条是空值，唯一的缺口
+[有] depot 2778580   15.02 GB     ★ 黄金树幽影
+[有] depot 2855520    1.01 GB     ★ 典藏包
+```
+
+生成的 lua 实测包含：
+
+```lua
+addappid(2778580, 0, "9f1556645ea8ef43529f920cf02a2682a6da5756b29e630ba376a0cde24e3908")
+setManifestid(2778580, "1674424364022381183")
+addappid(2855520, 0, "476eca9191866d6743aa7ad82d4d7ce1fcd5e0f0613f2f4b6559635d68f8c0e3")
+setManifestid(2855520, "2785904640065824767")
+```
+
+**这把钥匙在此之前扫遍全部 26 个公开仓库都找不到。**
+
+### 3.3.4 另两个资源维度
+
+**`appaccesstokens.json`**（`SteamAutoCracks/ManifestHub`，182295 字节）——`appId → accessToken` 映射。OpenSteamTool 支持 `addtoken(appid, token)`，可用于部分需要访问令牌的场景。**本项目暂未接入**（尚未验证其必要性与有效性）。
+
+**`SteamManifestCache` 系列**（3 个仓库，各 2.4-2.6 万分支）——提供 `.manifest` 数据 + `appinfo.vdf` + `config.json`，但**不含密钥**（实测 `appinfo.vdf` 里 `decryptionkey` 字样出现 0 次）。而 OpenSteamTool 从上游按 request code 拉取 manifest、不读本地文件，**故对该工具无用**。
+
+### 3.3.5 三类仓库的本质区别
 
 SDO 的 README 给出了权威定义：
 
@@ -219,14 +285,13 @@ SDO 原文对 Encrypted 的说明：
 
 | 仓库 | 分支数 | 密钥有效性 |
 |---|---|---|
+| `SteamAutoCracks/ManifestHub` 的 depotkeys.json | **175781 个有效 depot** | **✓ 全局覆盖** |
 | **Fairyvmos/bruh-hub** | **40461** | **✓ 抽样 5/5 有效** |
 | sean-who/ManifestAutoUpdate | 27795 | ✗ 128 字符哈希 |
 | Fairyvmos/BlankTMing | 29470 | ✗ 192 字符哈希 |
 | 11 个 Decrypted 仓库并集 | 8323 | ✓ 有效 |
 
-**一个 bruh-hub ≈ 旧方案全量并集的 4.9 倍，且质量更高。**
-
-**为何最初会漏掉它**：分支名是纯数字 AppID，但按字母序排序后 `10`/`20`/`1000000` 这些短数字排在前面，`814380` 这类 6 位 AppID 要翻很多页才出现，第一眼容易被误判为"分支名是随机串"。
+**为何最初会漏掉**：分支名是纯数字 AppID，但按字母序 `10`/`20`/`1000000` 这些短数字排在前面，`814380` 这类 6 位 AppID 要翻很多页才出现，第一眼容易被误判为"分支名是随机串"。
 
 **lua 生成**
 
@@ -347,14 +412,26 @@ hansaes             +450   = 8323
 | 巫师 3 | 292030 | **53 / 53** | 完整 |
 | 赛博朋克 2077 | 1091500 | **24 / 24** | 完整 |
 | 尼尔：机械纪元 | 524220 | **9 / 9** | 完整 |
-| 生化危机 4 | 2050650 | **31 / 31** | 完整（bruh-hub 一个源补齐，旧方案仅 2/31） |
+| 生化危机 4 | 2050650 | **31 / 31** | 完整（bruh-hub 补齐，旧方案仅 2/31） |
+| **艾尔登法环** | 1245620 | **7 / 8，69.20 GB** | **含黄金树幽影 + 典藏包**，仅缺 0.91GB 空值条目 |
+| 剑星 | 3489700 | **3 / 3** | 密钥齐全，但 **Denuvo** 拦在运行环节 |
 | 只狼 | 814380 | 5 / 6 | 缺 512B 空占位，已实测可玩 |
-| 艾尔登法环 | 1245620 | 4 / 8 | 本体 51.26GB 可用，**黄金树幽影 15.02GB 全 26 库均无** |
-| 控制 终极合辑 | 870780 | 4 / 5 | 最大的 42.73GB depot 缺密钥 |
-| 剑星 | 3489700 | 0 / 3 | Denuvo + 新作，不可行 |
-| 黑神话悟空 | 2358720 | 1 / ? | Denuvo，不可行 |
+| 控制 终极合辑 | 870780 | 4 / 5 | 最大的 42.73GB depot 仍缺 |
+| 黑神话悟空 | 2358720 | 1 / 1 | **Denuvo**，不可行 |
 
 **已实测入库成功的游戏**：只狼、赛博朋克 2077、巫师 3、艾尔登法环、尼尔：机械纪元。
+
+**主流 3A 筛查结论**（25 款抽样）：仅「死亡空间」有 Denuvo；加入 bruh-hub 与全局密钥表后，「生化危机 4」由不可行转为完整、「艾尔登法环」由缺 DLC 转为含 DLC；仅「控制 终极合辑」仍缺主内容。
+
+**覆盖率演进**（以艾尔登法环为例）：
+
+```
+初始（仅 Decrypted 仓库、只试 Key.vdf） : 4 / 8   缺黄金树幽影
++ Fairyvmos/bruh-hub                    : 4 / 8   该库无此游戏
++ 三种文件名兼容（config.vdf）            : 4 / 8
++ 全局密钥表 depotkeys.json              : 7 / 8   ★ 黄金树幽影到手
++ 接入 nekoaday/ManifestAutoUpdate       : 7 / 8
+```
 
 **主流 3A 筛查结论**（25 款抽样）：仅「死亡空间」有 Denuvo；「生化危机 4 / 控制」在加入 bruh-hub 后前者转为完整、后者仍缺主内容；其余 22 款均为「完整」或「主内容可用」。
 
