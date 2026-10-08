@@ -371,6 +371,9 @@ Say '本脚本不修改杀软设置、不劫持系统 DLL、不加载任何加�
 Say '所有落盘文件均为明文，可随时打开核对。'
 Write-Host ''
 
+# 预置启动脚本（g\<appid>.ps1）通过环境变量跳过确认，实现「一条命令跑完」
+if ($env:OST_YES -eq '1') { $Yes = $true }
+
 if (-not $Yes) {
     $ans = Read-Host '确认继续? (y/N)'
     if ($ans -ne 'y' -and $ans -ne 'Y') { Say '已取消'; return }
