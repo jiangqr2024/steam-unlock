@@ -513,21 +513,48 @@ Move-Item 'D:\steam-unlock-cli\park\1245620.lua' 'D:\steam\config\lua\1245620.lu
 ### 9.1 用户侧（一条命令）
 
 ```powershell
-# 当前（Pages 域名）
-irm https://jiangqr2024.github.io/steam-unlock/292030|iex
+# 自有域名（证书已于 2026-10-08 21:00 前后签发，到期 2027-01-06）
+irm https://jiangqr2026.xyz/814380|iex
 
-# 证书就绪后（自有域名，29 字符）
-irm https://jiangqr2026.xyz/292030|iex
+# 回退到 GitHub Pages 默认域名（证书异常时可用）
+irm https://jiangqr2024.github.io/steam-unlock/814380|iex
 ```
 
-**已发布的游戏**：
+**命令长度对比**：
 
-| 游戏 | AppID | 短地址 |
+| 形态 | 长度 | 备注 |
 |---|---|---|
-| 只狼 | 814380 | `/814380` |
-| 赛博朋克 2077 | 1091500 | `/1091500` |
-| 巫师 3 | 292030 | `/292030` |
-| 艾尔登法环 | 1245620 | `/1245620` |
+| 灰产参考 | 28 | `irm steam-install.xxxxxx\|iex` |
+| **本方案（最短）** | **38** | `irm https://jiangqr2026.xyz/814380\|iex` |
+| 本方案（publish 默认输出） | 46 | 带 `/g/` 与 `.ps1` |
+| 旧（github.io） | 57 | —— |
+
+**不要省略 `https://`**：`irm` 对无 scheme 的地址会自动补 `http://`，走明文。启动脚本是要被**执行**的代码，明文传输给了中间人注入的机会。
+
+**已发布的游戏**（全部为短域名版，launcher 内指向 `https://jiangqr2026.xyz/bootstrap.ps1`）：
+
+| 游戏 | AppID | 短地址 | 覆盖率 |
+|---|---|---|---|
+| 只狼 | 814380 | `/814380` | 100% |
+| 赛博朋克 2077 | 1091500 | `/1091500` | 100% |
+| 巫师 3 | 292030 | `/292030` | 100% |
+| 艾尔登法环 | 1245620 | `/1245620` | 7/8（含黄金树幽影） |
+| 尼尔：机械纪元 | 524220 | `/524220` | 100% |
+| 生化危机 4 | 2050650 | `/2050650` | 100% |
+
+### 9.1.1 域名与证书
+
+| 项 | 值 |
+|---|---|
+| 自有域名 | `jiangqr2026.xyz` |
+| DNS 托管 | Cloudflare（apex CNAME → `jiangqr2024.github.io`，**DNS only 灰云**） |
+| 解析结果 | Cloudflare flatten 为 GitHub 官方四 IP `185.199.108-111.153` |
+| 证书 | Let's Encrypt `CN=jiangqr2026.xyz`，签发 2026-10-08，到期 2027-01-06 |
+| 续期 | GitHub Pages 自动 |
+
+**配置要点**：Cloudflare 必须用**灰云（DNS only）**。开橙色云代理会隐藏源站 IP，GitHub 无法验证域名所有权、Let's Encrypt 也签不下证书。
+
+**注意**：设置自定义域名后，`jiangqr2024.github.io/steam-unlock/*` 会被 301 重定向到自有域名。DNS 未配好期间该地址会返回 502——配置自定义域名前应先确认 DNS 记录已就位。
 
 ### 9.2 发布新游戏
 
