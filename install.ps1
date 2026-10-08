@@ -215,7 +215,8 @@ paths = []
 # 保持 false，不向游戏进程注入，减少反作弊暴露面
 enabled = false
 "@
-    Set-Content -Path $toml -Value $body -Encoding UTF8
+    # 同样必须无 BOM：BOM 不是合法 TOML 起始字符
+    [System.IO.File]::WriteAllText($toml, $body, (New-Object System.Text.UTF8Encoding($false)))
     Ok '已写入 opensteamtool.toml'
 }
 
@@ -311,7 +312,10 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp) {
         New-Item -ItemType Directory -Force -Path $bk | Out-Null
         Copy-Item $target (Join-Path $bk "$id.lua") -Force
     }
-    Set-Content -Path $target -Value $sb.ToString() -Encoding UTF8
+    # 必须无 BOM 写入：Lua 解析器不识别 BOM，带 BOM 会让首行变成
+    # "\uFEFFaddappid(...)" 从而导致整个脚本解析失败。
+    # 注意 PS 5.1 的 Set-Content -Encoding UTF8 会写入 BOM，不能用于此处。
+    [System.IO.File]::WriteAllText($target, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 
     Ok "已写入 $target"
     Say "  depot 数: $($depots.Count)（带密钥 $withKey，无密钥 $noKey）"
