@@ -1,30 +1,18 @@
-# ============================================================
-#  Steam Unlock Installer - Bootstrap
-# ============================================================
-#  This file is short on purpose so you can read all of it.
-#  It only does three things:
-#     1) downloads the full installer, trying several mirrors
-#     2) prints the mirror used, the path and the SHA256
-#     3) runs it
+# ---- download loop ----
+# Mirror note: raw.githubusercontent.com serves a cached copy for a few minutes
+# after a push, so the *first* mirror can legitimately hand back a stale
+# install.ps1. That is why the hash check lives inside this loop: a mismatch
+# just means "this source is stale", not "we are under attack". The next source
+# is tried immediately. Only when every source fails do we refuse to run.
 #
-#  It does NOT hide anything. It does NOT touch antivirus settings.
-#  It does NOT use packed / encrypted / memory-loaded payloads.
-#  The only remote fetch is install.ps1 from the fixed URLs below.
-#
-#  Setup: replace  jiangqr2024  and  steam-unlock  with your own GitHub repo.
-#  Usage: irm <RAW_URL_OF_THIS_FILE> | iex
-# ============================================================
-
-$ErrorActionPreference = 'Stop'
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
-
+# Order: direct raw first (fastest when fresh), then GitHub proxies, then
+# jsDelivr (caches ~12h, so it may also lag right after an update).
 $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
-
-# Mirror order: direct raw first (fastest when reachable), then GitHub
-# proxies, then jsDelivr CDN as the last resort for networks where
-# raw.githubusercontent.com is blocked.
-# Note: jsDelivr caches branch content for roughly 12 hours, so it may
-# serve a slightly older install.ps1 right after you update the repo.
+#
+# Expected SHA256 of install.ps1. Maintained by sync-hashes.ps1 - run that
+# BEFORE pushing install.ps1, and push this file first.
+$INSTALL_SHA = 'ED45C291370F082C14918A8F33AD6BA1E20ACE42935BDA421F898C3379C4880C'
+#
 $SRCS = @(
     $RAW,
     'https://gh-proxy.com/' + $RAW,
@@ -42,6 +30,11 @@ Write-Host ''
 Write-Host 'Fetching installer (will try multiple mirrors) ...' -ForegroundColor Gray
 
 $used = $null
+$h = $null
+$sz = 0
+$sawStale = $false
+$sawTooSmall = $false
+
 foreach ($s in $SRCS) {
     $label = $s
     if ($label.Length -gt 70) { $label = $label.Substring(0, 67) + '...' }
@@ -49,11 +42,25 @@ foreach ($s in $SRCS) {
         try {
             Write-Host ("  attempt {0}/2 : {1}" -f $attempt, $label) -ForegroundColor DarkGray
             $null = Invoke-WebRequest -Uri $s -OutFile $DST -UseBasicParsing -TimeoutSec 45
-            if ((Get-Item $DST).Length -ge $MIN) { $used = $s; break }
-            Write-Host '                 response too small, will retry' -ForegroundColor DarkYellow
+            $sz = (Get-Item $DST).Length
+            if ($sz -lt $MIN) {
+                Write-Host '                 response too small, will retry' -ForegroundColor DarkYellow
+                $sawTooSmall = $true
+                continue
+            }
+            $h = (Get-FileHash $DST -Algorithm SHA256).Hash
+            if ($h -eq $INSTALL_SHA) { $used = $s; break }
+            # Wrong hash: almost always a stale CDN copy. Report and move on.
+            $sawStale = $true
+            Write-Host ("                 stale copy ({0}...), trying next source" -f $h.Substring(0, 12)) -ForegroundColor DarkYellow
+            break
         }
         catch {
-            if ($attempt -eq 2) { Write-Host '                 failed' -ForegroundColor DarkGray }
+            if ($attempt -eq 2) {
+                $msg = ''
+                if ($_.Exception) { $msg = $_.Exception.Message }
+                Write-Host ("                 failed: {0}" -f $msg) -ForegroundColor DarkGray
+            }
             Start-Sleep -Milliseconds 900
         }
     }
@@ -62,37 +69,31 @@ foreach ($s in $SRCS) {
 
 if (-not $used) {
     Write-Host ''
-    Write-Host '[x] All mirrors failed.' -ForegroundColor Red
-    Write-Host '    Check your network or proxy, then run the command again.' -ForegroundColor Red
+    Write-Host '[x] Could not obtain a verified install.ps1.' -ForegroundColor Red
+    if ($sawStale) {
+        Write-Host '    Every mirror that answered served a build that does not match the' -ForegroundColor Yellow
+        Write-Host '    expected SHA256. Most likely the CDN is still serving the previous' -ForegroundColor Yellow
+        Write-Host '    version. Wait 5-10 minutes and run the command again.' -ForegroundColor Yellow
+        Write-Host ("    expected: {0}" -f $INSTALL_SHA) -ForegroundColor Yellow
+        Write-Host ("    got     : {0}" -f $h) -ForegroundColor Yellow
+    }
+    elseif ($sawTooSmall) {
+        Write-Host '    Mirrors answered, but every response was too small to be the installer.' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host '    No mirror answered. Check your network or proxy, then retry.' -ForegroundColor Yellow
+    }
+    Write-Host ("    The last download is kept at: {0}" -f $DST) -ForegroundColor Yellow
     return
 }
-
-$h = (Get-FileHash $DST -Algorithm SHA256).Hash
-$sz = (Get-Item $DST).Length
 
 Write-Host ''
 Write-Host "[+] Mirror used : $used" -ForegroundColor Green
 Write-Host "[+] Saved to    : $DST" -ForegroundColor Green
 Write-Host "[+] Size        : $sz bytes" -ForegroundColor Green
 Write-Host "[+] SHA256      : $h" -ForegroundColor Green
+Write-Host "[+] Integrity   : matches the hash pinned in this file" -ForegroundColor Green
 Write-Host ''
-# ---- install.ps1 integrity check ----
-# Why this exists: this script feeds install.ps1 to iex. iex is not bound by
-# ExecutionPolicy, which is exactly why it works on locked-down machines - and
-# also why a swapped install.ps1 would go unnoticed. So the expected hash is
-# pinned here. Maintain it with sync-hashes.ps1 BEFORE uploading.
-# Fix: stop, save the file the mirror gave you, compare its hash, and check:
-#      https://github.com/jiangqr2024/steam-unlock/issues
-$INSTALL_SHA = 'ED45C291370F082C14918A8F33AD6BA1E20ACE42935BDA421F898C3379C4880C'
-if ($h -ne $INSTALL_SHA) {
-    Write-Host ''
-    Write-Host '[x] install.ps1 SHA256 mismatch - NOT running it.' -ForegroundColor Red
-    Write-Host '    expected: ' -NoNewline -ForegroundColor Red; Write-Host $INSTALL_SHA -ForegroundColor Red
-    Write-Host '    got     : ' -NoNewline -ForegroundColor Red; Write-Host $h -ForegroundColor Red
-    Write-Host '    The file is kept at the path above for inspection.' -ForegroundColor Yellow
-    return
-}
-
 Write-Host 'Want to read it before running?' -ForegroundColor Yellow
 Write-Host "  notepad `"$DST`"" -ForegroundColor Yellow
 Write-Host ''
