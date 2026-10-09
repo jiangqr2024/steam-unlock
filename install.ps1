@@ -576,7 +576,7 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
     $target = Join-Path $luaDir "$id.lua"
     if ($DryRun) {
         Write-Log "[DryRun] would write $luaDir\$id.lua"
-        Nice ("离线检查通过：{0} 个内容包，其中 {1} 个已配好密钥。" -f $depots.Count, $withKey)
+        Nice ("离线检查通过：{0} 个内容包，其中 {1} 个已配好密钥。" -f @($depots).Count, $withKey)
         if ($withKey -lt $depots.Count) { Warn ("有 {0} 个内容包没有密钥，这部分内容可能下载不完整。" -f $noKey) }
         return $true
     }
