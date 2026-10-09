@@ -11,7 +11,7 @@ $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.
 #
 # Expected SHA256 of install.ps1. Maintained by sync-hashes.ps1 - run that
 # BEFORE pushing install.ps1, and push this file first.
-$INSTALL_SHA = 'ED45C291370F082C14918A8F33AD6BA1E20ACE42935BDA421F898C3379C4880C'
+$INSTALL_SHA = '176F6BDEBCC010715324FBF4A7E97523C90B89DD173D6500CD332835E412932B'
 #
 $SRCS = @(
     $RAW,
