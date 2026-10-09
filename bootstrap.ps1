@@ -30,7 +30,7 @@ $API_BASE = 'https://api.jiangqr2026.xyz'
 $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
 
 # Expected SHA256 of install.ps1. Maintained only by sync-hashes.ps1.
-$INSTALL_SHA = '79C9D41DBCAB822A0695A643E4306084748693B63628C7B3EB33763404368FA1'
+$INSTALL_SHA = 'E710A0827B38EE7C63533B8E12CDDA3BEE5E5372102B84A9E67D2A2FF0574840'
 
 $DST = Join-Path $env:TEMP 'ost-install.ps1'
 $MIN = 2000
