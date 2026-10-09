@@ -745,7 +745,7 @@ function Do-Uninstall([string]$root) {
 # $env:OST_API 是给测试用的覆盖开关（本地 mock 服务端），生产环境不要设置。
 $API_BASE = 'https://api.jiangqr2026.xyz'
 if ($env:OST_API) { $API_BASE = $env:OST_API; Write-Log ("api base overridden: $API_BASE") }
-$API_TIMEOUT_SEC = 5
+$API_TIMEOUT_SEC = 3
 
 # ══ 主流程 ══════════════════════════════════════════════════════
 Write-Host ''
