@@ -3,18 +3,18 @@
 # ============================================================
 #  Short on purpose, so you can read all of it in a few seconds.
 #  It does exactly three things:
-#     1) fetches the real installer (install.ps1) from a list of mirrors
-#     2) checks its SHA256 against the value pinned below
+#     1) asks the optional API for the current release info (hash + mirrors)
+#     2) fetches install.ps1 from a list of mirrors, retrying until the SHA256 matches
 #     3) runs it
 #
-#  It hides nothing, does not touch antivirus settings, and does not use
-#  packed or memory-loaded payloads. The only remote fetches are the fixed
-#  URLs below.
+#  It hides nothing, does not touch antivirus settings, and does not use packed
+#  or memory-loaded payloads. The only remote fetches are the URLs below.
 #
-#  NOTE ON LANGUAGE: this file must stay pure ASCII. It is fetched with
-#  Invoke-RestMethod and handed to iex, and PowerShell 5.1 decodes that
-#  without a charset hint as Latin-1 - non-ASCII bytes would come out as
-#  garbage (and garbage inside a comment or string breaks the parse).
+#  The API step is optional: if it is unreachable, the built-in hash and mirror
+#  list below are used instead, and everything still works.
+#
+#  NOTE ON LANGUAGE: this file must stay pure ASCII. It is executed via
+#  iex, and PowerShell 5.1 decodes non-ASCII bytes using the ANSI code page.
 #  install.ps1 has no such limit: it is written to disk and re-read with
 #  Get-Content, so it keeps its UTF-8 BOM and full Chinese output.
 #
@@ -26,16 +26,51 @@
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
-# Mirror order: direct raw first (fastest when it is fresh), then GitHub
-# proxies, then jsDelivr. raw.githubusercontent.com keeps serving the
-# previous copy for a few minutes after a push, so the first mirror can
-# legitimately return a stale build. The loop below treats a hash mismatch
-# as "this source is stale" and moves on - it does not abort.
+$API_BASE = 'https://api.jiangqr2026.xyz'
 $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
 
 # Expected SHA256 of install.ps1. Maintained only by sync-hashes.ps1.
-$INSTALL_SHA = '176F6BDEBCC010715324FBF4A7E97523C90B89DD173D6500CD332835E412932B'
+$INSTALL_SHA = '79C9D41DBCAB822A0695A643E4306084748693B63628C7B3EB33763404368FA1'
 
+$DST = Join-Path $env:TEMP 'ost-install.ps1'
+$MIN = 2000
+
+Write-Host ''
+Write-Host '  Downloading installer ...' -ForegroundColor Cyan
+
+# ---- optional release manifest -------------------------------------------
+# The API, when it has been deployed, knows the authoritative hash. Using it
+# removes the "stale hash in a stale bootstrap" failure mode: the client can
+# learn that a newer build exists instead of insisting on an old one.
+if ($env:OST_API) { $API_BASE = $env:OST_API }
+$apiInfo = $null
+if ($API_BASE) {
+    try {
+        $apiInfo = Invoke-RestMethod -Uri "$API_BASE/v1/latest" -TimeoutSec 5 -ErrorAction Stop
+    } catch { $apiInfo = $null }
+}
+if ($apiInfo) {
+    if ($apiInfo.install_sha256 -and $apiInfo.install_sha256.Length -eq 64) {
+        $INSTALL_SHA = $apiInfo.install_sha256
+    }
+    if ($apiInfo.halt) {
+        $why = 'The installer has been paused server-side.'
+        if ($apiInfo.reason) { $why = [string]$apiInfo.reason }
+        Write-Host ''
+        Write-Host ('  Halted: ' + $why) -ForegroundColor Red
+        Write-Host '  Nothing was changed on your computer.'
+        Write-Host ''
+        return
+    }
+    if ($apiInfo.note) { Write-Host ('  ' + $apiInfo.note) -ForegroundColor Yellow }
+}
+
+# ---- mirrors -------------------------------------------------------------
+# Order: direct raw first (fastest when fresh), then GitHub proxies, then
+# jsDelivr. raw.githubusercontent.com keeps serving the previous copy for a
+# few minutes after a push, so the first mirror can legitimately return a
+# stale build. The loop treats a hash mismatch as "this source is stale" and
+# moves on - it does not abort.
 $SRCS = @(
     $RAW,
     'https://gh-proxy.com/' + $RAW,
@@ -43,12 +78,6 @@ $SRCS = @(
     'https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/install.ps1',
     'https://fastly.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/install.ps1'
 )
-
-$DST = Join-Path $env:TEMP 'ost-install.ps1'
-$MIN = 2000
-
-Write-Host ''
-Write-Host '  Downloading installer ...' -ForegroundColor Cyan
 
 $used = $null
 $h = $null
