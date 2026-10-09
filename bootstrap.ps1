@@ -83,7 +83,7 @@ Write-Host ''
 # pinned here. Maintain it with sync-hashes.ps1 BEFORE uploading.
 # Fix: stop, save the file the mirror gave you, compare its hash, and check:
 #      https://github.com/jiangqr2024/steam-unlock/issues
-$INSTALL_SHA = '5C7FC1E4E77E77ED92B16650028F56F48BC2898734805D71E8BD6621105C7442'
+$INSTALL_SHA = 'ED45C291370F082C14918A8F33AD6BA1E20ACE42935BDA421F898C3379C4880C'
 if ($h -ne $INSTALL_SHA) {
     Write-Host ''
     Write-Host '[x] install.ps1 SHA256 mismatch - NOT running it.' -ForegroundColor Red
