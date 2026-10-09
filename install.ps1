@@ -441,20 +441,28 @@ function Get-DepotPlan([int]$id) {
 
 # 下载一个文件（支持 gzip）。不用 Invoke-WebRequest 的 -OutFile：
 # 它在 PS 5.1 下会按文本解码，二进制压缩包会被破坏。
+# 下载一个文件，可选 gzip 解压。
+# 不用 Invoke-WebRequest 的 -OutFile：PS 5.1 下它按文本解码，二进制压缩包会被破坏。
+# 也不用 HttpClient：这个类型在 PS 5.1 里没被加载（会报"找不到类型…的程序集"），
+# 而那个失败是静默的 —— 表现为"所有下载源都秒失败"，排查起来很费时间。
+# HttpWebRequest 是 .NET Framework 原生的，PS 5.1 直接可用。
 function Download-File([string]$url, [string]$dest, [int]$timeoutSec, [switch]$Gzip) {
     try {
-        $hc = New-Object System.Net.Http.HttpClient
-        $hc.Timeout = [TimeSpan]::FromSeconds($timeoutSec)
-        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
-        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'ost-install')
-        $resp = $hc.SendAsync($req).GetAwaiter().GetResult()
-        if (-not $resp.IsSuccessStatusCode) { return $false }
-        $st = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        if ($Gzip) { $st = New-Object System.IO.Compression.GZipStream($st, [IO.Compression.CompressionMode]::Decompress) }
+        $req = [Net.HttpWebRequest]::Create($url)
+        $req.UserAgent = 'ost-install'
+        $req.Timeout = $timeoutSec * 1000
+        $req.ReadWriteTimeout = $timeoutSec * 1000
+        try { $req.AutomaticDecompression = [Net.DecompressionMethods]::GZip } catch { }
+        $resp = $req.GetResponse()
+        $rs = $resp.GetResponseStream()
+        if ($Gzip) {
+            $rs = New-Object System.IO.Compression.GZipStream($rs, [IO.Compression.CompressionMode]::Decompress)
+        }
         $fs = [IO.File]::Create($dest)
-        try { $st.CopyTo($fs) } finally { $fs.Close(); $st.Close(); $hc.Dispose() }
+        try { $rs.CopyTo($fs) } finally { $fs.Close(); $rs.Close(); $resp.Close() }
         return $true
     } catch {
+        Write-Log ("download failed: " + $url + " -- " + $_.Exception.Message) 'WARN'
         return $false
     }
 }
@@ -464,7 +472,9 @@ function Download-File([string]$url, [string]$dest, [int]$timeoutSec, [switch]$G
 # 镜像补不齐的 depot，通常都能在这里找到，所以它的可用性直接决定成不成。
 function Get-GlobalKeyTable([string]$cache) {
     $srcs = @(
-        @{ u = "$API_BASE/depotkeys.json.gz"; g = $true;  n = 'self-hosted (gzip)' },
+        # 注意域名区别：密钥表是静态文件，放在 Pages 主域（jiangqr2026.xyz），
+        # 不是服务端 API 的 api 子域 —— 两者不可混用。
+        @{ u = 'https://jiangqr2026.xyz/depotkeys.json.gz'; g = $true;  n = 'self-hosted (gzip)' },
         @{ u = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'; g = $false; n = 'github raw' }
     )
     foreach ($s in $srcs) {
