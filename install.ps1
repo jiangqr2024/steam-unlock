@@ -385,18 +385,30 @@ function Get-DepotKeys([int]$id, $needDepots) {
             Write-Host ("[*]   仍有 {0} 个 depot 缺密钥，尝试全局密钥表 ..." -f $stillMissing.Count)
             try {
                 $globalUrl = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'
-                $cache = Join-Path $PSScriptRoot 'depotkeys-cache.json'
+                # 缓存路径不能建立在 $PSScriptRoot 上：install.ps1 在 irm|iex 场景里没有
+                # 脚本文件上下文，这个变量是空的。整个 try 块又没有 catch，异常会沿着
+                # 外层 catch 被吞掉 —— 结果就是"看起来有缓存，实际永远不命中"。
+                $cacheDir = Join-Path $env:LOCALAPPDATA 'ost-cache'
+                $cache = Join-Path $cacheDir 'depotkeys.json'
                 $gj = $null
                 if ((Test-Path $cache) -and (((Get-Date) - (Get-Item $cache).LastWriteTime).TotalDays -lt 7)) {
-                    Say '    使用本地缓存的全局密钥表（7 天内有效）'
-                    try { $gj = Get-Content $cache -Raw | ConvertFrom-Json } catch { $gj = $null }
+                    try {
+                        $gj = Get-Content $cache -Raw | ConvertFrom-Json
+                        Say '    使用本地缓存的全局密钥表（7 天内有效）'
+                    } catch { $gj = $null; Warn '    本地缓存损坏，改为重新下载' }
                 }
                 if (-not $gj) {
-                    $gj = Invoke-RestMethod -Uri $globalUrl -TimeoutSec 120 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+                    # 先落原始文件再解析：避免 PS 的 ConvertTo-Json/ConvertFrom-Json
+                    # 往返在这张 28 万条目的表上引入任何差异。
+                    $rawTmp = Join-Path $env:TEMP ('ost-depotkeys-' + (Get-Random) + '.json')
+                    Invoke-WebRequest -Uri $globalUrl -OutFile $rawTmp -UseBasicParsing -TimeoutSec 180
                     try {
-                        $gj | ConvertTo-Json -Compress -Depth 2 | Set-Content $cache -Encoding UTF8
+                        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+                        Copy-Item $rawTmp $cache -Force
                         Say "    已缓存全局密钥表 -> $cache"
                     } catch { Warn "    缓存写入失败（不影响本次运行）: $($_.Exception.Message)" }
+                    $gj = Get-Content $rawTmp -Raw | ConvertFrom-Json
+                    Remove-Item $rawTmp -Force -ErrorAction SilentlyContinue
                 }
                 $gained = 0
                 foreach ($d in $stillMissing) {
@@ -507,8 +519,12 @@ function Restore-SteamComponents([string]$root, [string]$stamp, [switch]$Yes) {
             if (Test-Path $p) { $cand = $p }
         }
         if (-not $cand) {
-            $p = Join-Path $PSScriptRoot "..\backup\original-steam-dlls\$f"
-            if (Test-Path $p) { $cand = $p }
+            # 同样的原因：iex 场景下 $PSScriptRoot 为空，只能用固定候选路径。
+            # 这里找不到也不会出错，只是少一个还原来源。
+            foreach ($base in @('D:\steam-unlock-cli')) {
+                $p = Join-Path $base "backup\original-steam-dlls\$f"
+                if (Test-Path $p) { $cand = $p; break }
+            }
         }
         if (-not $cand) {
             $dirs = @(Get-ChildItem $BACKUP_ROOT -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
