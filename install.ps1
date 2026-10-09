@@ -941,17 +941,11 @@ if ($totalBytes -gt 0) {
         $need = [int64]($totalBytes * 0.25)
         $srcTxt = "depot 合计 {0:N1} GB（按 1/4 粗估）" -f ($totalBytes/1GB)
     }
+# 空间只记日志、不给用户看：入库本身不占空间，下载是另一件事，什么时候点
+# 安装由用户自己决定。这里保留记录是为了以后排查“这个游戏多大”。
 $dp = Get-DiskPrecheck $steam $need
 if ($dp) {
-    $needGb = [math]::Round($need / 1GB, 1)
-    if ($dp.Ok) {
-        Write-Log ("disk ok: free {0:N1} GB vs need {1:N1} GB on {2}" -f ($dp.Free/1GB), $needGb, $dp.Drive)
-    } else {
-        # 入库和下载是两件事：这一步只让游戏出现在库里，不占任何空间。
-        # 空间不足只提醒、不阻断 —— 完全可以先入库，等腾出空间再点安装。
-        Warn ("这个游戏装完约 {0:N1} GB，$($dp.Drive)\ 现在只剩 {1:N1} GB。" -f $needGb, ($dp.Free/1GB))
-        Nice '不影响入库。想玩的时候在 Steam 里点安装就行。'
-    }
+    Write-Log ("install size estimate {0:N1} GB; free on {1}: {2:N1} GB" -f [math]::Round($need/1GB,1), $dp.Drive, ($dp.Free/1GB))
 }
 }
 
