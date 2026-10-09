@@ -73,6 +73,21 @@ $MANIFEST_MIRROR = 'steamrun'
 
 $BACKUP_ROOT = Join-Path $env:LOCALAPPDATA 'ost-backup'
 
+# 只问一次 /v1/latest，后面多处复用这个结果，并把它当作 L2/L3 的开关：
+# 探测失败就整条链路退回本地逻辑。HTTP 404 之类的也会走 catch —— 对客户端
+# 来说"端点不存在"和"服务不可达"是同一件事：就不做这次增强。
+function Get-ApiStatus {
+    try {
+        $r = Invoke-RestMethod -Uri "$API_BASE/v1/latest" -TimeoutSec $API_TIMEOUT_SEC `
+             -Headers @{ 'User-Agent' = 'ost-install' } -ErrorAction Stop
+        Write-Log "api: reachable (api_version=$($r.api_version))"
+        return $r
+    } catch {
+        Write-Log "api: unavailable - $($_.Exception.Message)"
+        return $null
+    }
+}
+
 # 实测过的真实体积。单位 GB。
 # 为什么需要它：appinfo 的 depot 体积求和与真实下载量无关——Steam 会按语言/
 # 平台筛选，例如博德之门 3 的 53 个 depot 合计 449.4 GB，实际只需 145.75 GB。
@@ -362,10 +377,11 @@ function Write-Config([string]$root, [string]$stamp) {
 
     $body = @"
 # OpenSteamTool 配置 — 由自建安装脚本生成
-# 上游 request code 服务：opensteamtool / steamrun / wudrm
-# 实测 opensteamtool -> 403、wudrm -> 503、steamrun -> 200，故固定用 steamrun
-[manifest]
-url = "$MANIFEST_MIRROR"
+# [manifest] 这一节由 install.ps1 按服务端可用性生成：
+#   url_template = 自建网关（多上游竞速 + 故障转移）
+#   url          = 直连内置上游
+# 想固定用直连，就把下一行的 url_template 换成 url = "steamrun"
+$manifestBlock
 
 timeout_resolve_ms = 5000
 timeout_connect_ms = 5000
@@ -720,6 +736,17 @@ function Do-Uninstall([string]$root) {
     return $true
 }
 
+# ---- 可选的服务端层 ----------------------------------------------
+# 这三层是加速与冗余，不是必经路径：任何一个不可达时，本脚本必须能用原有
+# 方式把游戏装完。这是硬约束，改动这里时不要破坏它。
+#   L1 网关      manifest request code 的多上游转发，写进 opensteamtool.toml
+#   L2 短码      别名 -> AppID（服务端只返回数字，不含密钥）
+#   L3 发布清单  权威哈希与最高可用版本（自检 + 叫停）
+# $env:OST_API 是给测试用的覆盖开关（本地 mock 服务端），生产环境不要设置。
+$API_BASE = 'https://api.jiangqr2026.xyz'
+if ($env:OST_API) { $API_BASE = $env:OST_API; Write-Log ("api base overridden: $API_BASE") }
+$API_TIMEOUT_SEC = 5
+
 # ══ 主流程 ══════════════════════════════════════════════════════
 Write-Host ''
 Write-Host '  Steam 游戏解锁' -ForegroundColor Cyan
@@ -760,18 +787,58 @@ if ($AppId -le 0 -and $env:OST_APPID) {
     $tmpId = 0
     if ([int]::TryParse($env:OST_APPID, [ref]$tmpId)) { $AppId = $tmpId }
 }
-if ($AppId -le 0) {
+# 解析目标：纯数字直接当 AppID；否则交给 L2 换数字。
+# 环境变量优先于参数 —— launcher 是通过环境变量传值的。
+$apiInfo = Get-ApiStatus
+
+# L3：服务端可以在 /v1/latest 里下发提示或叫停。用途是"发现某个版本有
+# 问题时先让所有人停下来"，所以优先级最高，且必须发生在任何写盘之前。
+if ($apiInfo) {
+    if ($apiInfo.note) { Write-Host ('  ' + $apiInfo.note) -ForegroundColor Yellow }
+    if ($apiInfo.halt) {
+        $why = '服务端已暂停本工具的安装流程'
+        if ($apiInfo.reason) { $why = [string]$apiInfo.reason }
+        Write-Log ("halted by server: " + $why) 'ERROR'
+        Write-Host ''
+        Write-Host ('  已暂停：' + $why) -ForegroundColor Red
+        Write-Host '  没有对你的电脑做任何改动。'
+        Write-Host ''
+        return
+    }
+}
+
+$targetRaw = ''
+if ($env:OST_APPID) { $targetRaw = [string]$env:OST_APPID }
+if (-not $targetRaw -and $env:OST_ALIAS) { $targetRaw = [string]$env:OST_ALIAS }
+if ($AppId -gt 0) { $targetRaw = [string]$AppId }
+
+if (-not $targetRaw) {
     if (-not $script:CANPROMPT) {
         Stop-WithUserMessage 'E-NO-INFO' 'no appid given and no interactive host to ask'
         return
     }
-    $line = Read-Host '请输入要入库的游戏 AppID（商店页 URL 里的数字）'
-    $tmpId = 0
-    if (-not [int]::TryParse($line, [ref]$tmpId) -or $tmpId -le 0) {
-        Stop-WithUserMessage 'E-NO-INFO' ('invalid appid input: ' + $line)
+    $targetRaw = Read-Host '请输入要入库的游戏 AppID（商店页 URL 里的数字）'
+}
+
+$tmpId = 0
+if ([int]::TryParse($targetRaw, [ref]$tmpId) -and $tmpId -gt 0) {
+    $AppId = $tmpId
+} else {
+    # 短码路径：服务端只返回一个数字，密钥仍然由本脚本自己去公开渠道取。
+    if (-not $apiInfo) {
+        Stop-WithUserMessage 'E-ALIAS' ("alias needs the api, which is unreachable: " + $targetRaw)
         return
     }
-    $AppId = $tmpId
+    try {
+        $al = Invoke-RestMethod -Uri "$API_BASE/v1/alias?c=$targetRaw" -TimeoutSec $API_TIMEOUT_SEC `
+              -Headers @{ 'User-Agent' = 'ost-install' } -ErrorAction Stop
+        if (-not $al.appid) { throw 'response had no appid' }
+        $AppId = [int]$al.appid
+        Write-Log "alias $targetRaw -> $AppId"
+    } catch {
+        Stop-WithUserMessage 'E-ALIAS' ("alias lookup failed: " + $targetRaw)
+        return
+    }
 }
 Write-Log "target appid: $AppId"
 
@@ -804,6 +871,36 @@ if (-not (Install-Components $steam $stamp)) {
     if (-not $c) { $c = 'E-COMPONENT-WRITE' }
     Stop-WithUserMessage $c 'Install-Components returned false'
     return
+}
+
+Write-Host ''
+# 服务端探测放在这里：它同时决定 toml 的 manifest 上游怎么写、短码能不能
+# 解析、要不要接受叫停。只问一次，避免每个功能各探一遍。
+
+# L1：网关可用就走网关，不可用就直连内置上游。探针用一个必然非法的 request
+# code（0），网关会回 400；只要不是 404/5xx 就说明这条路由是活的。
+$manifestBlock = "[manifest]`nurl = `"$MANIFEST_MIRROR`""
+if ($apiInfo) {
+    $gwOk = $false
+    try {
+        $null = Invoke-WebRequest -Uri "$API_BASE/api/manifest/0" -UseBasicParsing `
+                -TimeoutSec $API_TIMEOUT_SEC -ErrorAction Stop
+        $gwOk = $true
+    } catch {
+        $resp = $null
+        if ($_.Exception) { $resp = $_.Exception.Response }
+        if ($resp) {
+            $code = 0
+            try { $code = [int]$resp.StatusCode } catch { }
+            if ($code -eq 400 -or $code -eq 502) { $gwOk = $true }
+        }
+    }
+    if ($gwOk) {
+        $manifestBlock = "[manifest]`nurl_template = `"$API_BASE/api/manifest/%llu`""
+        Write-Log "manifest gateway enabled ($API_BASE)"
+    } else {
+        Write-Log 'manifest gateway probe failed; keeping direct upstream' 'WARN'
+    }
 }
 
 Write-Config $steam $stamp | Out-Null
