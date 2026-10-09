@@ -72,6 +72,10 @@ $MIRRORS = @(
 $MANIFEST_MIRROR = 'steamrun'
 
 $BACKUP_ROOT = Join-Path $env:LOCALAPPDATA 'ost-backup'
+# 保留的语音语言：中文、英文，以及跨语言共用的（language 字段为空）。
+# 想多留一种语言就往这里加（用 Valve 的写法：schinese / english / japanese...）。
+# 加得越多下载越大 —— 巫师3 每多一种语音大约多 1-2 GB。
+$LANG_KEEP = @('schinese', 'english')
 
 # 只问一次 /v1/latest，后面多处复用这个结果，并把它当作 L2/L3 的开关：
 # 探测失败就整条链路退回本地逻辑。HTTP 404 之类的也会走 catch —— 对客户端
@@ -445,14 +449,40 @@ function Get-DepotPlan([int]$id) {
     }
 
     $list = New-Object System.Collections.Generic.List[object]
+    $any = $false
     foreach ($k in $app.depots.PSObject.Properties.Name) {
         if ($k -notmatch '^\d+$') { continue }
         $dd = $app.depots.$k
         $gid = $dd.manifests.public.gid
         if (-not $gid) { continue }
+        # 平台过滤：一个游戏常有 windows / macos / linux 三份 depot，体积各占一份。
+        # 不过滤的后果：配置里塞进另外两个平台的内容，Steam 目前会自己忽略，
+        # 但那是在赌它的行为；而"安装大小"这类判断也会被三倍数字带偏。
+        # 空的 oslist 表示跨平台共用（例如语音包），必须保留。
+        $os = $dd.config.oslist
+        if ($os -and $os -notmatch '(?i)windows') { continue }
+        # 语言过滤：语音包常按语言单独做成 depot（巫师3 有 30 个语言 depot，
+        # 波兰语/德语/法语/俄语/日语/葡语/韩语各一份）。全声明等于把八种配音
+        # 都拉一遍。空的 language 表示跨语言共用（比如文本、贴图），必须保留。
+        $lang = $dd.config.language
+        if ($lang -and $LANG_KEEP -notcontains ([string]$lang).ToLower()) { continue }
         $sz = 0
         try { $sz = [int64]$dd.manifests.public.size } catch { }
         $list.Add([pscustomobject]@{ Id = $k; Gid = [string]$gid; Size = $sz })
+        $any = $true
+    }
+    if (-not $any) {
+        # 全部被过滤掉说明 oslist 表达方式跟我预期不同，退回不过滤更安全
+        Write-Log "platform filter removed everything for appid $id; keeping all depots" 'WARN'
+        foreach ($k in $app.depots.PSObject.Properties.Name) {
+            if ($k -notmatch '^\d+$') { continue }
+            $dd = $app.depots.$k
+            $gid = $dd.manifests.public.gid
+            if (-not $gid) { continue }
+            $sz = 0
+            try { $sz = [int64]$dd.manifests.public.size } catch { }
+            $list.Add([pscustomobject]@{ Id = $k; Gid = [string]$gid; Size = $sz })
+        }
     }
     return $list
 }
@@ -997,7 +1027,8 @@ $sizeMap = @{}
 foreach ($d in $depots) { $sizeMap["$($d.Id)"] = [int64]$d.Size }
 $totalBytes = ($depots | Measure-Object -Property Size -Sum).Sum
 if ($totalBytes -gt 0) {
-    Write-Log ("depot total {0:N1} GB across {1} depots (sum of all platform/language depots, not download size)" -f ($totalBytes/1GB), $depots.Count)
+    $depotCount = @($depots).Count
+    Write-Log ("depot total {0:N1} GB across {1} depot(s), windows only" -f ($totalBytes/1GB), $depotCount)
     if ($KNOWN_SIZE[[int]$AppId]) { Write-Log ("known install size {0:N1} GB" -f $KNOWN_SIZE[[int]$AppId]) }
 }
 
