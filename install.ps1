@@ -86,11 +86,79 @@ $KNOWN_SIZE = @{
     814380  = 13.87    # 只狼
 }
 
-# ── 输出助手 ─────────────────────────────────────────────────────
-function Say  ($m) { Write-Host "[*] $m" }
-function Ok   ($m) { Write-Host "[+] $m" -ForegroundColor Green }
-function Warn ($m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function Fail ($m) { Write-Host "[x] $m" -ForegroundColor Red }
+# ── 输出层 ───────────────────────────────────────────────────────
+# 分两层，这是给"别人用"的前提：
+#   用户层   console 只出进度与结论，一句话一件事，不带任何内部术语
+#   技术层   全部细节写进日志文件；失败时把最后几行随错误一起打出来
+# 理由很直接：用户在装游戏，不需要知道我们扫了几个镜像、哪个仓库给了多少密钥。
+# 但失败时他要把信息发回给我们，所以那一刻细节必须有。
+$script:LOGPATH = $null
+$script:LOGTAIL = New-Object System.Collections.Generic.List[string]
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    if (-not $script:LOGPATH) { return }
+    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
+    try { Add-Content -Path $script:LOGPATH -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
+    if ($Message -match '\[x\]|\[!\]|ERR|错误|失败') {
+        [void]$script:LOGTAIL.Add($line)
+        while ($script:LOGTAIL.Count -gt 8) { $script:LOGTAIL.RemoveAt(0) }
+    }
+}
+
+# 进度：一句话，一件事。重复调用同一句时只打印一次，避免滚动屏。
+function Step {
+    param([string]$Message, [string]$Key)
+    if (-not $Key) { $Key = $Message }
+    if ($script:LASTSTEP -eq $Key) { return }
+    $script:LASTSTEP = $Key
+    Write-Host $Message -ForegroundColor Cyan
+    Write-Log $Message
+}
+
+function Say  ($m) { Write-Log $m }
+function Ok   ($m) { Write-Log $m 'OK' }
+function Warn ($m) { Write-Host "  ! $m" -ForegroundColor Yellow; Write-Log $m 'WARN' }
+function Nice ($m) { Write-Host "  $m"; Write-Log $m }
+function Fail ($m) { Write-Log $m 'ERROR' }
+
+# 错误表：失败码 -> 一句话结论 + 一个动作。
+# Retry = $true 表示"同样的命令再跑一次可能就成了"，失败出口会据此补一句重试建议。
+$script:ERRORS = @{
+    'E-STEAM-NOTFOUND'  = @{ T = '没有找到 Steam。';              A = '确认电脑上装了 Steam；装在其他盘的话，把命令换成 .\install.ps1 -SteamPath "你的路径"'; R = $false }
+    'E-COMPONENT-DL'    = @{ T = '组件下载失败，网络没连上。';      A = '换个网络，或者先开代理再跑一次同样的命令。'; R = $true }
+    'E-COMPONENT-SUM'   = @{ T = '组件校验不通过，已主动中止。';    A = '你的文件没有被改动。这通常是下载过程中被改坏了，隔几分钟再跑一次。'; R = $true }
+    'E-COMPONENT-WRITE' = @{ T = '写不进 Steam 目录。';            A = '用管理员身份重新打开 PowerShell 再跑一次。'; R = $false }
+    'E-COMPONENT-BLOCK' = @{ T = '组件被安全软件拦下了。';          A = '在安全软件里把 Steam 安装目录加进"排除项"，然后重跑。'; R = $false }
+    'E-STEAM-BUSY'      = @{ T = 'Steam 没有完全退出。';           A = '在右下角托盘里右键退出 Steam，等 10 秒，再跑一次。'; R = $true }
+    'E-NO-INFO'         = @{ T = '这个 AppID 读不到游戏信息。';     A = '确认那个数字是对的（Steam 商店页地址里那串数字）。'; R = $false }
+    'E-NO-KEYS'         = @{ T = '这个游戏暂时没有可用的解锁数据。'; A = '换个游戏试试。如果很多游戏都这样，隔一天再来看。'; R = $true }
+    'E-NET'             = @{ T = '网络请求失败。';                 A = '检查网络后重跑；开着代理的话先关掉试试。'; R = $true }
+    'E-UNKNOWN'         = @{ T = '出现了预期之外的问题。';          A = '把下面的日志尾部发给我，我来定位。'; R = $false }
+}
+
+# 失败出口：所有失败都必须走这里，保证"一句话结论 + 一个动作"。
+# 细节不进 console —— 用户在装游戏，不想看堆栈；但它们会进日志，且尾部随错误一起打出来。
+function Stop-WithUserMessage {
+    param([string]$Code, [string]$Detail, [int]$ExitCode = 1)
+    $e = $script:ERRORS[$Code]
+    if (-not $e) { $e = $script:ERRORS['E-UNKNOWN']; $Code = 'E-UNKNOWN' }
+    if ($Detail) { Write-Log ("detail: " + $Detail) 'ERROR' }
+
+    Write-Host ''
+    Write-Host ('  出错了，已经停下来（' + $e.T + '）') -ForegroundColor Red
+    Write-Host ('  ' + $e.A)
+    if ($e.R) { Write-Host '  修好之后，直接用同样的命令再跑一次就行。' -ForegroundColor DarkGray }
+    Write-Host ('  错误码 ' + $Code) -ForegroundColor DarkGray
+    if ($script:LOGPATH) { Write-Host ('  日志 ' + $script:LOGPATH) -ForegroundColor DarkGray }
+    if ($script:LOGTAIL.Count -gt 0) {
+        Write-Host '  ---- 下面这段发给我 ----' -ForegroundColor DarkGray
+        foreach ($l in $script:LOGTAIL) { Write-Host ('  ' + $l) -ForegroundColor DarkGray }
+    }
+    Write-Host ''
+    if (-not $DryRun) { try { exit $ExitCode } catch { return } }
+    return
+}
 
 function Get-SteamRoot {
     if ($SteamPath) { return $SteamPath }
@@ -144,8 +212,9 @@ function Stop-SteamProcesses([string]$root) {
 # 预检失败时的统一询问出口。
 # 注意：-DryRun 不询问，直接继续（它不会改动任何东西）。
 function Ask-Continue([string]$reason) {
-    if ($Yes -or $DryRun) { Warn "继续（未确认）: $reason"; return $true }
-    $ans = Read-Host "仍要继续? (y/N)"
+    if ($Yes -or $DryRun) { Write-Log ('continue without asking: ' + $reason); return $true }
+    if (-not $script:CANPROMPT) { Write-Log ('no interactive host; assuming yes: ' + $reason) 'WARN'; return $true }
+    $ans = Read-Host '仍要继续? (y/N)'
     return ($ans -eq 'y' -or $ans -eq 'Y')
 }
 
@@ -214,32 +283,35 @@ function Install-Components([string]$root, [string]$stamp) {
     try {
         Invoke-WebRequest -Uri $REL_ZIP -OutFile $zip -UseBasicParsing -TimeoutSec 240
     } catch {
-        Fail "下载失败: $($_.Exception.Message)"
+        Fail "download failed: $($_.Exception.Message)"
+        $script:ERRCODE = 'E-COMPONENT-DL'
         return $false
     }
 
     $h = (Get-FileHash $zip -Algorithm SHA256).Hash
     if ($h -ne $REL_SHA) {
-        Fail '压缩包 SHA256 与预期不符，已中止。'
-        Say  "  预期: $REL_SHA"
-        Say  "  实际: $h"
+        Fail "release zip sha256 mismatch: expected $REL_SHA, got $h"
+        $script:ERRCODE = 'E-COMPONENT-SUM'
         return $false
     }
-    Ok '压缩包 SHA256 校验通过'
+    Write-Log "release zip sha256 ok" 'OK'
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
 
     foreach ($f in $DLL_SHA.Keys) {
         $src = Join-Path $tmp $f
-        if (-not (Test-Path $src)) { Fail "包内缺少 $f"; return $false }
-        $fh = (Get-FileHash $src -Algorithm SHA256).Hash
-        if ($fh -ne $DLL_SHA[$f]) {
-            Fail "$f 的 SHA256 与预期不符，已中止。"
-            Say  "  预期: $($DLL_SHA[$f])"
-            Say  "  实际: $fh"
+        if (-not (Test-Path $src)) {
+            Fail "component missing in package: $f"
+            $script:ERRCODE = 'E-COMPONENT-SUM'
             return $false
         }
-        Ok "$f 校验通过"
+        $fh = (Get-FileHash $src -Algorithm SHA256).Hash
+        if ($fh -ne $DLL_SHA[$f]) {
+            Fail "$f sha256 mismatch: expected $($DLL_SHA[$f]), got $fh"
+            $script:ERRCODE = 'E-COMPONENT-SUM'
+            return $false
+        }
+        Write-Log "$f sha256 ok" 'OK'
     }
 
     # 备份现有同名文件（可能是其他工具的组件）
@@ -254,13 +326,15 @@ function Install-Components([string]$root, [string]$stamp) {
         try {
             Copy-Item (Join-Path $tmp $f) $dst -Force -ErrorAction Stop
         } catch {
-            Fail "写入 $f 失败：$($_.Exception.Message)"
+            Fail "write $f failed: $($_.Exception.Message)"
+            $script:ERRCODE = 'E-COMPONENT-WRITE'
             if (-not (Ask-Continue "组件未写入，配置将生成但不会生效")) { return $false }
             return $true
         }
         # 写入后复校：杀软隔离、磁盘写入错误都会在这里暴露，而不是等到启动 Steam 才失败
         if ((Get-FileHash $dst -Algorithm SHA256).Hash -ne $DLL_SHA[$f]) {
-            Warn "$f 写入后哈希不符（可能被安全软件拦截或篡改）"
+            Fail "$f changed after write (AV quarantine or tampering)"
+            $script:ERRCODE = 'E-COMPONENT-BLOCK'
             if (-not (Ask-Continue '该组件哈希校验失败')) { return $false }
         }
     }
@@ -317,11 +391,22 @@ function Get-DepotPlan([int]$id) {
     try {
         $info = Invoke-RestMethod -Uri "https://api.steamcmd.net/v1/info/$id" -TimeoutSec 40 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
     } catch {
-        Warn "拉取 appinfo 失败: $($_.Exception.Message)"
+        Fail "appinfo request failed: $($_.Exception.Message)"
+        $script:ERRCODE = 'E-NET'
+        return @()
+    }
+    if ($info.status -and $info.status -ne 'success') {
+        Fail ("appinfo status: " + $info.status)
+        $script:ERRCODE = 'E-NO-INFO'
         return @()
     }
     $app = $info.data."$id"
-    if (-not $app) { return @() }
+    if (-not $app) {
+        # HTTP 200 但表里没有这个 appid：不是网络问题，重试也没用
+        Fail "appid $id not present in appinfo"
+        $script:ERRCODE = 'E-NO-INFO'
+        return @()
+    }
 
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($k in $app.depots.PSObject.Properties.Name) {
@@ -382,7 +467,7 @@ function Get-DepotKeys([int]$id, $needDepots) {
     if ($needDepots -and @($needDepots).Count -gt 0) {
         $stillMissing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
         if ($stillMissing.Count -gt 0) {
-            Write-Host ("[*]   仍有 {0} 个 depot 缺密钥，尝试全局密钥表 ..." -f $stillMissing.Count)
+            Write-Log ("{0} depot(s) still missing; consulting the global key table" -f $stillMissing.Count)
             try {
                 $globalUrl = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'
                 # 缓存路径不能建立在 $PSScriptRoot 上：install.ps1 在 irm|iex 场景里没有
@@ -394,7 +479,7 @@ function Get-DepotKeys([int]$id, $needDepots) {
                 if ((Test-Path $cache) -and (((Get-Date) - (Get-Item $cache).LastWriteTime).TotalDays -lt 7)) {
                     try {
                         $gj = Get-Content $cache -Raw | ConvertFrom-Json
-                        Say '    使用本地缓存的全局密钥表（7 天内有效）'
+                        Write-Log 'using cached global key table (within 7 days)'
                     } catch { $gj = $null; Warn '    本地缓存损坏，改为重新下载' }
                 }
                 if (-not $gj) {
@@ -405,7 +490,7 @@ function Get-DepotKeys([int]$id, $needDepots) {
                     try {
                         New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
                         Copy-Item $rawTmp $cache -Force
-                        Say "    已缓存全局密钥表 -> $cache"
+                        Write-Log "cached global key table -> $cache"
                     } catch { Warn "    缓存写入失败（不影响本次运行）: $($_.Exception.Message)" }
                     $gj = Get-Content $rawTmp -Raw | ConvertFrom-Json
                     Remove-Item $rawTmp -Force -ErrorAction SilentlyContinue
@@ -474,12 +559,9 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
 
     $target = Join-Path $luaDir "$id.lua"
     if ($DryRun) {
-        Say "[DryRun] 不写盘。将生成的内容如下："
-        Write-Host '---------- lua 预览 ----------'
-        Write-Host $sb.ToString()
-        Write-Host '------------------------------'
-        Say "  depot 数: $($depots.Count)（带密钥 $withKey，无密钥 $noKey）"
-        Say '  预览结束（未落盘）。去掉 -DryRun 即为真正写入。'
+        Write-Log "[DryRun] would write $luaDir\$id.lua"
+        Nice ("离线检查通过：{0} 个内容包，其中 {1} 个已配好密钥。" -f $depots.Count, $withKey)
+        if ($withKey -lt $depots.Count) { Warn ("有 {0} 个内容包没有密钥，这部分内容可能下载不完整。" -f $noKey) }
         return $true
     }
     if (Test-Path $target) {
@@ -640,14 +722,25 @@ function Do-Uninstall([string]$root) {
 
 # ══ 主流程 ══════════════════════════════════════════════════════
 Write-Host ''
-Write-Host '=== Steam 解锁一键安装（自建安全版）===' -ForegroundColor Cyan
+Write-Host '  Steam 游戏解锁' -ForegroundColor Cyan
 Write-Host ''
 
-$steam = Get-SteamRoot
-if (-not $steam) { Fail '未找到 Steam 安装目录，请用 -SteamPath 指定'; return }
-Ok "Steam 目录: $steam"
-
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$logDir = Join-Path $env:LOCALAPPDATA 'ost-backup'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+$script:LOGPATH = Join-Path $logDir ("run-$stamp.log")
+$script:CANPROMPT = $true
+try { $null = Read-Host -Prompt "" } catch { $script:CANPROMPT = $false }
+Write-Log ('interactive prompt available: ' + $script:CANPROMPT)
+
+$steam = Get-SteamRoot
+if (-not $steam) {
+    Stop-WithUserMessage 'E-STEAM-NOTFOUND' 'Get-SteamRoot returned null'
+    return
+}
+Write-Log "steam root: $steam"
+Write-Log "powershell: $($PSVersionTable.PSVersion)"
+Write-Log "dryrun: $DryRun  yes: $Yes  norestart: $NoRestart"
 
 if ($Uninstall) { Do-Uninstall $steam | Out-Null; return }
 
@@ -658,8 +751,8 @@ try {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch { }
 if (-not $isAdmin) {
-    Warn '当前不是管理员权限：写入 Steam 目录可能失败；被安全软件拦截时也无法自动处理。'
-    Warn '若下一步出现"拒绝访问"，请重开一个管理员 PowerShell 再跑本命令。'
+    Warn '建议用管理员身份运行，否则可能写不进 Steam 目录。'
+    Write-Log 'not running as administrator'
 }
 
 # 取 AppID：参数 -> 环境变量 -> 交互输入
@@ -668,51 +761,55 @@ if ($AppId -le 0 -and $env:OST_APPID) {
     if ([int]::TryParse($env:OST_APPID, [ref]$tmpId)) { $AppId = $tmpId }
 }
 if ($AppId -le 0) {
+    if (-not $script:CANPROMPT) {
+        Stop-WithUserMessage 'E-NO-INFO' 'no appid given and no interactive host to ask'
+        return
+    }
     $line = Read-Host '请输入要入库的游戏 AppID（商店页 URL 里的数字）'
     $tmpId = 0
-    if (-not [int]::TryParse($line, [ref]$tmpId) -or $tmpId -le 0) { Fail 'AppID 无效'; return }
+    if (-not [int]::TryParse($line, [ref]$tmpId) -or $tmpId -le 0) {
+        Stop-WithUserMessage 'E-NO-INFO' ('invalid appid input: ' + $line)
+        return
+    }
     $AppId = $tmpId
 }
-Ok "目标 AppID: $AppId"
+Write-Log "target appid: $AppId"
 
-Write-Host ''
-Say '即将执行：'
-Say "  1) 关闭 Steam"
-Say "  2) 下载 OpenSteamTool 官方 Release 并校验 SHA256（若本地已匹配则跳过）"
-Say "  3) 写入 dwmapi.dll / xinput1_4.dll / OpenSteamTool.dll（原文件先备份）"
-Say "  4) 写入 opensteamtool.toml（上游固定 steamrun）"
-Say "  5) 依据 appinfo 与公开清单库生成 config\lua\$AppId.lua"
-Say '  6) 重新启动 Steam'
-Write-Host ''
-Say '本脚本不修改杀软设置、不劫持系统 DLL、不加载任何加壳或加密载荷。'
-Say '所有落盘文件均为明文，可随时打开核对。'
-Write-Host ''
+Write-Log 'preflight listing suppressed (user-facing mode)'
 
 # 预置启动脚本（g\<appid>.ps1）通过环境变量跳过确认，实现「一条命令跑完」
 if ($env:OST_YES -eq '1') { $Yes = $true }
 
-if (-not $Yes) {
+if (-not $Yes -and $script:CANPROMPT) {
     $ans = Read-Host '确认继续? (y/N)'
-    if ($ans -ne 'y' -and $ans -ne 'Y') { Say '已取消'; return }
+    if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host '  已取消。'; Write-Log 'cancelled by user'; return }
 }
 
-Write-Host ''
-Say '正在关闭 Steam ...'
 if ($DryRun) {
     Warn '[DryRun] 跳过关闭 Steam'
 } else {
-    if (-not (Stop-SteamProcesses $steam)) { Warn '部分文件仍被占用，继续尝试写入' }
-    Ok 'Steam 已停止'
+    Step '正在连接 Steam 服务...' 'stop-steam'
+    if (-not (Stop-SteamProcesses $steam)) {
+        Write-Log 'some files still locked' 'WARN'
+        if (-not (Ask-Continue 'Steam 没有完全退出，组件可能写不进去')) {
+            Stop-WithUserMessage 'E-STEAM-BUSY' 'user aborted after steam files stayed locked'
+            return
+        }
+    }
+    Step '正在准备游戏组件...' 'components'
 }
 
-Write-Host ''
-Say '准备组件 ...'
-if (-not (Install-Components $steam $stamp)) { Fail '组件准备失败，已中止（原有文件未改动）'; return }
+if (-not (Install-Components $steam $stamp)) {
+    $c = $script:ERRCODE
+    if (-not $c) { $c = 'E-COMPONENT-WRITE' }
+    Stop-WithUserMessage $c 'Install-Components returned false'
+    return
+}
 
 Write-Config $steam $stamp | Out-Null
 
-Write-Host ''
-Say '解析 depot 结构 ...'
+Step '正在读取游戏信息...' 'gameinfo'
+Write-Log "resolving depot plan for appid $AppId"
 $depots = Get-DepotPlan $AppId
 
 # appinfo 返回的是"当前 public 分支"的 depots，通常覆盖主体内容。
@@ -721,8 +818,8 @@ $sizeMap = @{}
 foreach ($d in $depots) { $sizeMap["$($d.Id)"] = [int64]$d.Size }
 $totalBytes = ($depots | Measure-Object -Property Size -Sum).Sum
 if ($totalBytes -gt 0) {
-    Say ("  本体 depot 合计 {0:N1} GB（{1} 个）——这是各平台/语言 depot 的总和，不是真实下载量" -f ($totalBytes/1GB), $depots.Count)
-    if ($KNOWN_SIZE[[int]$AppId]) { Say ("  该 AppID 实测下载量 {0:N1} GB（见 `$KNOWN_SIZE 表）" -f $KNOWN_SIZE[[int]$AppId]) }
+    Write-Log ("depot total {0:N1} GB across {1} depots (sum of all platform/language depots, not download size)" -f ($totalBytes/1GB), $depots.Count)
+    if ($KNOWN_SIZE[[int]$AppId]) { Write-Log ("known install size {0:N1} GB" -f $KNOWN_SIZE[[int]$AppId]) }
 }
 
 # 磁盘预检：只提示、不阻断。装到哪块盘由用户在 Steam 里决定，
@@ -739,15 +836,19 @@ if ($totalBytes -gt 0) {
     }
     $dp = Get-DiskPrecheck $steam $need
     if ($dp) {
+        $needGb = [math]::Round($need / 1GB, 1)
         if ($dp.Ok) {
-            Ok ("磁盘预检: $($dp.Drive)\ 剩余 {0:N1} GB，{1}，空间充裕" -f ($dp.Free/1GB), $srcTxt)
+            Write-Log ("disk ok: free {0:N1} GB vs need {1:N1} GB on {2}" -f ($dp.Free/1GB), $needGb, $dp.Drive)
         } elseif ($dp.AnyRootOk) {
-            Warn ("默认库 $($dp.Drive)\ 剩余 {0:N1} GB 偏紧（{1}）。" -f ($dp.Free/1GB), $srcTxt)
-            Warn '其他库位置空间更充裕，可在 Steam 里选择装到别的盘。'
+            Warn ("$($dp.Drive)\ 只剩 {0:N1} GB，这个游戏要装 {1:N1} GB。" -f ($dp.Free/1GB), $needGb)
+            Nice '你还有别的库位置空间够用，在 Steam 里选那个盘安装就行。'
         } else {
-            Warn ("磁盘空间不足：$($dp.Drive)\ 剩余 {0:N1} GB，{1}。" -f ($dp.Free/1GB), $srcTxt)
-            Warn '现在开始下载很可能中途失败。库位置：' + ($dp.Roots -join ' | ')
-            if (-not (Ask-Continue '磁盘空间不足')) { Say '已取消（配置未改动）'; return }
+            Warn ("磁盘空间不够：$($dp.Drive)\ 只剩 {0:N1} GB，这个游戏要装 {1:N1} GB。" -f ($dp.Free/1GB), $needGb)
+            Nice ('可以清理一些空间，或者在 Steam 里换个盘装。库位置：' + ($dp.Roots -join ' / '))
+            if (-not (Ask-Continue '磁盘空间不足')) {
+                Stop-WithUserMessage 'E-DISK-FULL' "user declined at disk precheck (free $($dp.Free))"
+                return
+            }
         }
     }
 }
@@ -761,7 +862,8 @@ try {
     if ($sdApp -and $sdApp.success -and $sdApp.data.dlc) { $dlcIds = @($sdApp.data.dlc) }
 } catch { }
 if ($dlcIds.Count -gt 0) {
-    Say "检测到 $($dlcIds.Count) 个 DLC，纳入其 app 声明与独立 depot ..."
+    Write-Log "dlc detected: $($dlcIds -join ', ')"
+    Nice "这款游戏包含 $($dlcIds.Count) 个 DLC，会一起装好。"
     # 每个 DLC 查一次 appinfo，下面取密钥时复用，避免同一接口请求两遍
     $dlcPlans = @{}
     foreach ($dlcId in $dlcIds) {
@@ -776,16 +878,22 @@ if ($dlcIds.Count -gt 0) {
                 $added++
             }
         }
-        Say "    DLC $dlcId : 独立 depot $($dlcDepots.Count) 个（新增 $added）"
+        Write-Log "dlc $dlcId : own depots $($dlcDepots.Count), newly added $added"
     }
 }
 
 if ($depots.Count -eq 0) {
-    Warn '未能解析出 depot 列表，将只写入 addappid(本体)，由工具自行向上游索取清单'
+    # 一个 depot 都拿不到时，写出 addappid(appid) 是个空配置：游戏会进库，
+    # 但 0 B 内容。与其让用户以为装好了，不如在这里停下并把原因说清楚。
+    $c = $script:ERRCODE
+    if (-not $c) { $c = 'E-NO-INFO' }
+    Write-Log "depot plan empty for appid $AppId (code $c)" 'WARN'
+    Stop-WithUserMessage $c "empty depot plan for appid $AppId"
+    return
 }
 
-Write-Host ''
-Say '获取 depot 解密密钥 ...'
+Step '正在取得游戏数据...' 'keys'
+Write-Log 'collecting depot keys from public mirrors'
 $keyInfo = Get-DepotKeys $AppId $depots
 
 # DLC 若带独立 depot，其密钥可能在 DLC 自己的分支下，逐个补取
@@ -806,10 +914,10 @@ if ($dlcIds.Count -gt 0) {
     }
 }
 if ($keyInfo) {
-    Ok "共取到 $($keyInfo.Keys.Count) 个 depot 密钥，来源："
-    foreach ($s in $keyInfo.Sources) { Say "    $s" }
+    Write-Log ("keys collected: {0}" -f $keyInfo.Keys.Count)
+    foreach ($s in $keyInfo.Sources) { Write-Log ("  source: $s") }
 } else {
-    Warn '所有镜像均无该 appid 的 Key.vdf，将不写密钥（下载可能失败，属该游戏未被收录）'
+    Write-Log 'no key source matched this appid' 'WARN'
 }
 
 # 有密钥源时只声明有密钥的 depot。
@@ -820,13 +928,16 @@ if ($keyInfo -and $depots.Count -gt 0) {
     if ($plan.Count -eq 0) {
         # 一个密钥都没有时，"回退为声明全部"只会让 Steam 挂载一堆无法解密的
         # depot，表现是安装大小 0 B / 直接失败，比什么都不写更糟。
-        Fail '本体与 DLC 的所有 depot 都没有拿到解密密钥，本 AppID 未被任何公开库收录。'
-        Warn '继续下去只会写入一个无效配置。若要强行尝试（仅用于实验），请加 -Yes 重跑。'
-        if (-not ($Yes -or $DryRun)) { Say '已中止（配置未改动）'; return }
+        Fail 'no depot key available for this appid'
+        if (-not ($Yes -or $DryRun)) {
+            Stop-WithUserMessage 'E-NO-KEYS' "appid $AppId produced 0 usable depots"
+            return
+        }
+        Write-Log 'forcing full depot declaration because -Yes was given' 'WARN'
         $plan = $depots
     }
     elseif ($plan.Count -lt $depots.Count) {
-        Say "  已过滤 $($depots.Count - $plan.Count) 个无密钥 depot（清单库未收录）"
+        Write-Log ("filtered out {0} depot(s) without keys" -f ($depots.Count - $plan.Count))
     }
 }
 
@@ -836,19 +947,21 @@ Write-Lua $steam $AppId $plan $keyInfo $stamp $dlcIds | Out-Null
 Write-Host ''
 if ($DryRun) {
     Warn '[DryRun] 到此为止：未下载组件、未写任何文件、未启动 Steam'
+    Write-Host ('  日志：' + $script:LOGPATH) -ForegroundColor DarkGray
     return
 }
 if ($NoRestart) {
-    Warn '按 -NoRestart 要求，未启动 Steam。手动启动后配置生效。'
+    Warn '按 -NoRestart 要求，未启动 Steam。手动启动后生效。'
 } else {
-    Say '启动 Steam ...'
+    Step '正在完成配置...' 'launch'
     Start-Process (Join-Path $steam 'Steam.exe')
     Start-Sleep -Seconds 5
-    Ok 'Steam 已启动'
 }
 
 Write-Host ''
-Ok '完成。'
-Say "备份目录: $BACKUP_ROOT\$stamp"
-Say "卸载命令: .\install.ps1 -Uninstall"
+Write-Host '  完成了。打开 Steam，游戏会出现在库中。' -ForegroundColor Green
+Write-Host '  库里暂时没有的话，等 1-2 分钟（Steam 刷新库有延迟），或者重启一次 Steam。'
+Write-Host ''
+Write-Host '  卸载：再跑一次命令，把最后的数字换成 -Uninstall'
+Write-Host ('  日志：' + $script:LOGPATH) -ForegroundColor DarkGray
 Write-Host ''
