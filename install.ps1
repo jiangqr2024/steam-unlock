@@ -403,11 +403,31 @@ enabled = false
     Ok '已写入 opensteamtool.toml'
 }
 
+# 取某个 appid 的 depot 结构。
+# 这里必须重试：实测这个接口是"抖动型"的 —— 连续 5 次测都正常（250-1000ms），
+# 但偶尔会超时一次。之前没有重试，一次超时就让整条流程失败退出，而用户看到
+# 的只是"网络请求失败"。对家用网络来说，重试是最便宜也最有效的修复。
 function Get-DepotPlan([int]$id) {
-    try {
-        $info = Invoke-RestMethod -Uri "https://api.steamcmd.net/v1/info/$id" -TimeoutSec 40 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-    } catch {
-        Fail "appinfo request failed: $($_.Exception.Message)"
+    $urls = @(
+        "https://api.steamcmd.net/v1/info/$id"
+    )
+    $info = $null
+    $lastErr = ''
+    foreach ($u in $urls) {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                $info = Invoke-RestMethod -Uri $u -TimeoutSec 40 -Headers @{ 'User-Agent' = 'Mozilla/5.0' } -ErrorAction Stop
+                break
+            } catch {
+                $lastErr = $_.Exception.Message
+                Write-Log ("appinfo attempt $attempt failed for $id : $lastErr") 'WARN'
+                if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
+            }
+        }
+        if ($info) { break }
+    }
+    if (-not $info) {
+        Fail "appinfo request failed for appid $id : $lastErr"
         $script:ERRCODE = 'E-NET'
         return @()
     }
@@ -432,8 +452,6 @@ function Get-DepotPlan([int]$id) {
         if (-not $gid) { continue }
         $sz = 0
         try { $sz = [int64]$dd.manifests.public.size } catch { }
-        # appinfo 的 size 是 manifest 记录的大小，通常等于内容体积，
-        # 但压缩/分片过的 depot 可能偏小，所以它只作参考值。
         $list.Add([pscustomobject]@{ Id = $k; Gid = [string]$gid; Size = $sz })
     }
     return $list
