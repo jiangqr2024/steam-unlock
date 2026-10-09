@@ -745,7 +745,13 @@ function Do-Uninstall([string]$root) {
 # $env:OST_API 是给测试用的覆盖开关（本地 mock 服务端），生产环境不要设置。
 $API_BASE = 'https://api.jiangqr2026.xyz'
 if ($env:OST_API) { $API_BASE = $env:OST_API; Write-Log ("api base overridden: $API_BASE") }
-$API_TIMEOUT_SEC = 3
+# 首次请求要算上 Workers 冷启动 + 用户自己那段网络，实测 3.5 秒左右是常态。
+# 这里给足余量：超时只会让用户白等，而探测失败会丢掉一整层加速能力。
+# 用户可用环境变量 OST_API_TIMEOUT 覆盖（例：网络好就设 2，省等待时间）。
+$API_TIMEOUT_SEC = 8
+if ($env:OST_API_TIMEOUT -and [int]::TryParse($env:OST_API_TIMEOUT, [ref]$null)) {
+    $API_TIMEOUT_SEC = [int]$env:OST_API_TIMEOUT
+}
 
 # ══ 主流程 ══════════════════════════════════════════════════════
 Write-Host ''
