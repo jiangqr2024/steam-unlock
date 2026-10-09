@@ -23,7 +23,8 @@ param(
     [string]$SteamPath,
     [switch]$Uninstall,
     [switch]$NoRestart,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +73,19 @@ $MANIFEST_MIRROR = 'steamrun'
 
 $BACKUP_ROOT = Join-Path $env:LOCALAPPDATA 'ost-backup'
 
+# 实测过的真实体积。单位 GB。
+# 为什么需要它：appinfo 的 depot 体积求和与真实下载量无关——Steam 会按语言/
+# 平台筛选，例如博德之门 3 的 53 个 depot 合计 449.4 GB，实际只需 145.75 GB。
+# 拿求和值去比对剩余空间只会制造假警报，所以已实测的游戏用真实值，未知的用宽松阈值。
+$KNOWN_SIZE = @{
+    1086940 = 145.75   # 博德之门 3 + 2 DLC
+    1245620 = 69.2     # 艾尔登法环 + 黄金树幽影
+    2050650 = 62.81    # 生化危机 4
+    292030  = 54.72    # 巫师 3
+    524220  = 40.34    # 尼尔：机械纪元
+    814380  = 13.87    # 只狼
+}
+
 # ── 输出助手 ─────────────────────────────────────────────────────
 function Say  ($m) { Write-Host "[*] $m" }
 function Ok   ($m) { Write-Host "[+] $m" -ForegroundColor Green }
@@ -102,7 +116,12 @@ function Stop-SteamProcesses([string]$root) {
         }
         catch { Warn "调用 Steam.exe -shutdown 失败（$($_.Exception.Message)），改为直接结束进程" }
     }
-    Start-Sleep -Seconds 6
+    # 进程退出用轮询而不是固定 6 秒：多数机器 2 秒内就退干净了，
+    # 固定等待只是白白拖慢每次"一条命令"的体感。
+    for ($w = 0; $w -lt 20; $w++) {
+        if (-not (Get-Process -Name 'steam' -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 500
+    }
     foreach ($n in @('steam', 'steamwebhelper', 'steamservice', 'steamerrorreporter')) {
         Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     }
@@ -122,6 +141,52 @@ function Stop-SteamProcesses([string]$root) {
     return $false
 }
 
+# 预检失败时的统一询问出口。
+# 注意：-DryRun 不询问，直接继续（它不会改动任何东西）。
+function Ask-Continue([string]$reason) {
+    if ($Yes -or $DryRun) { Warn "继续（未确认）: $reason"; return $true }
+    $ans = Read-Host "仍要继续? (y/N)"
+    return ($ans -eq 'y' -or $ans -eq 'Y')
+}
+
+# 估算游戏体积，并推断 Steam 会把它装到哪一块盘，再比对剩余空间。
+# 这一步存在的理由很直接：本机 D: 只剩 60 余 GB 时，145 GB 的博德之门 3
+# 连下载都进不去，脚本却会一路宣告"完成"。
+function Get-DiskPrecheck([string]$root, [int64]$needBytes) {
+    if ($needBytes -le 0) { return $null }
+    $lv = Join-Path $root 'steamapps\libraryfolders.vdf'
+    $cands = New-Object System.Collections.Generic.List[object]
+    if (Test-Path $lv) {
+        try {
+            $txt = Get-Content $lv -Raw
+            foreach ($mm in [regex]::Matches($txt, '"path"\s*"([^"]+)"')) {
+                $p = $mm.Groups[1].Value -replace '\\\\', '\'
+                $d = $p
+                if ($d -match '^([A-Za-z]):') { $d = $Matches[1] + ':' }
+                if ($d -match '^[A-Za-z]:$') { $cands.Add([pscustomobject]@{ Root = $p; Drive = $d }) }
+            }
+        } catch { }
+    }
+    if ($cands.Count -eq 0) {
+        $d = (Split-Path $root -Qualifier)
+        $cands.Add([pscustomobject]@{ Root = $root; Drive = $d })
+    }
+    $head = $cands[0]
+    $free = $null
+    try { $free = (Get-PSDrive -Name $head.Drive.TrimEnd(':') -ErrorAction Stop).Free } catch { }
+    if ($null -eq $free) { return $null }
+    return [pscustomobject]@{
+        Need      = $needBytes
+        Free      = [int64]$free
+        Drive     = $head.Drive
+        Roots     = @($cands | ForEach-Object { $_.Root })
+        Ok        = ($free -ge ($needBytes * 1.15))
+        AnyRootOk = (@($cands | Where-Object {
+                        try { (Get-PSDrive -Name $_.Drive.TrimEnd(':') -ErrorAction Stop).Free -ge ($needBytes * 1.15) } catch { $false }
+                    }).Count -gt 0)
+    }
+}
+
 function Test-LocalComponents([string]$root) {
     foreach ($f in $DLL_SHA.Keys) {
         $p = Join-Path $root $f
@@ -132,6 +197,10 @@ function Test-LocalComponents([string]$root) {
 }
 
 function Install-Components([string]$root, [string]$stamp) {
+    if ($DryRun) {
+        Say "[DryRun] 跳过组件下载与写入（目标 $root）"
+        return $true
+    }
     if (Test-LocalComponents $root) {
         Ok '三个组件已存在且哈希与官方 Release 一致，跳过下载'
         return $true
@@ -182,7 +251,18 @@ function Install-Components([string]$root, [string]$stamp) {
             Copy-Item $dst (Join-Path $bk $f) -Force
             Say "已备份原有 $f -> $bk"
         }
-        Copy-Item (Join-Path $tmp $f) $dst -Force
+        try {
+            Copy-Item (Join-Path $tmp $f) $dst -Force -ErrorAction Stop
+        } catch {
+            Fail "写入 $f 失败：$($_.Exception.Message)"
+            if (-not (Ask-Continue "组件未写入，配置将生成但不会生效")) { return $false }
+            return $true
+        }
+        # 写入后复校：杀软隔离、磁盘写入错误都会在这里暴露，而不是等到启动 Steam 才失败
+        if ((Get-FileHash $dst -Algorithm SHA256).Hash -ne $DLL_SHA[$f]) {
+            Warn "$f 写入后哈希不符（可能被安全软件拦截或篡改）"
+            if (-not (Ask-Continue '该组件哈希校验失败')) { return $false }
+        }
     }
 
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
@@ -193,6 +273,11 @@ function Install-Components([string]$root, [string]$stamp) {
 
 function Write-Config([string]$root, [string]$stamp) {
     $toml = Join-Path $root 'opensteamtool.toml'
+
+    if ($DryRun) {
+        Say "[DryRun] 不写、不备份 opensteamtool.toml（目标 $toml）"
+        return $true
+    }
 
     if (Test-Path $toml) {
         $bk = Join-Path $BACKUP_ROOT $stamp
@@ -241,10 +326,14 @@ function Get-DepotPlan([int]$id) {
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($k in $app.depots.PSObject.Properties.Name) {
         if ($k -notmatch '^\d+$') { continue }
-        $gid = $app.depots.$k.manifests.public.gid
-        if ($gid) {
-            $list.Add([pscustomobject]@{ Id = $k; Gid = [string]$gid })
-        }
+        $dd = $app.depots.$k
+        $gid = $dd.manifests.public.gid
+        if (-not $gid) { continue }
+        $sz = 0
+        try { $sz = [int64]$dd.manifests.public.size } catch { }
+        # appinfo 的 size 是 manifest 记录的大小，通常等于内容体积，
+        # 但压缩/分片过的 depot 可能偏小，所以它只作参考值。
+        $list.Add([pscustomobject]@{ Id = $k; Gid = [string]$gid; Size = $sz })
     }
     return $list
 }
@@ -296,7 +385,19 @@ function Get-DepotKeys([int]$id, $needDepots) {
             Write-Host ("[*]   仍有 {0} 个 depot 缺密钥，尝试全局密钥表 ..." -f $stillMissing.Count)
             try {
                 $globalUrl = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'
-                $gj = Invoke-RestMethod -Uri $globalUrl -TimeoutSec 120 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+                $cache = Join-Path $PSScriptRoot 'depotkeys-cache.json'
+                $gj = $null
+                if ((Test-Path $cache) -and (((Get-Date) - (Get-Item $cache).LastWriteTime).TotalDays -lt 7)) {
+                    Say '    使用本地缓存的全局密钥表（7 天内有效）'
+                    try { $gj = Get-Content $cache -Raw | ConvertFrom-Json } catch { $gj = $null }
+                }
+                if (-not $gj) {
+                    $gj = Invoke-RestMethod -Uri $globalUrl -TimeoutSec 120 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+                    try {
+                        $gj | ConvertTo-Json -Compress -Depth 2 | Set-Content $cache -Encoding UTF8
+                        Say "    已缓存全局密钥表 -> $cache"
+                    } catch { Warn "    缓存写入失败（不影响本次运行）: $($_.Exception.Message)" }
+                }
                 $gained = 0
                 foreach ($d in $stillMissing) {
                     $prop = $gj.PSObject.Properties | Where-Object { $_.Name -eq [string]$d.Id }
@@ -320,7 +421,7 @@ function Get-DepotKeys([int]$id, $needDepots) {
 
 function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $extraApps) {
     $luaDir = Join-Path $root 'config\lua'
-    New-Item -ItemType Directory -Force -Path $luaDir | Out-Null
+    if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $luaDir | Out-Null }
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('-- OpenSteamTool unlock script — 由自建安装脚本生成')
@@ -360,6 +461,15 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
     }
 
     $target = Join-Path $luaDir "$id.lua"
+    if ($DryRun) {
+        Say "[DryRun] 不写盘。将生成的内容如下："
+        Write-Host '---------- lua 预览 ----------'
+        Write-Host $sb.ToString()
+        Write-Host '------------------------------'
+        Say "  depot 数: $($depots.Count)（带密钥 $withKey，无密钥 $noKey）"
+        Say '  预览结束（未落盘）。去掉 -DryRun 即为真正写入。'
+        return $true
+    }
     if (Test-Path $target) {
         $bk = Join-Path $BACKUP_ROOT $stamp
         New-Item -ItemType Directory -Force -Path $bk | Out-Null
@@ -375,21 +485,112 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
     return $true
 }
 
+# 卸载时要处理的组件。优先还原"上一个工具留下的同名文件"，
+# 没有可还原的备份时直接删除——删掉之后 Steam 会回落到 system32 的系统库。
+# 顺序很重要：先备份 -> 再删除，避免把代理 DLL 当成原件拷来拷去。
+function Restore-SteamComponents([string]$root, [string]$stamp, [switch]$Yes) {
+    $bkRoot = Join-Path $BACKUP_ROOT $stamp
+    foreach ($f in $DLL_SHA.Keys) {
+        $dst = Join-Path $root $f
+        if (-not (Test-Path $dst)) { continue }
+
+        $cur = (Get-FileHash $dst -Algorithm SHA256).Hash
+        if ($cur -ne $DLL_SHA[$f]) {
+            Say "  $f 当前内容不是本项目的组件（哈希不符），保持原样不删除"
+            continue
+        }
+
+        # 找最近一次备份里这个文件
+        $cand = $null
+        if (Test-Path $bkRoot) {
+            $p = Join-Path $bkRoot $f
+            if (Test-Path $p) { $cand = $p }
+        }
+        if (-not $cand) {
+            $p = Join-Path $PSScriptRoot "..\backup\original-steam-dlls\$f"
+            if (Test-Path $p) { $cand = $p }
+        }
+        if (-not $cand) {
+            $dirs = @(Get-ChildItem $BACKUP_ROOT -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            foreach ($d in $dirs) {
+                $p = Join-Path $d.FullName $f
+                if (Test-Path $p) { $cand = $p; break }
+            }
+        }
+
+        if ($cand) {
+            $bh = (Get-FileHash $cand -Algorithm SHA256).Hash
+            if ($bh -eq $DLL_SHA[$f]) {
+                Warn "备份里的 $f 仍是本项目的组件（哈希相同），不可还原，将直接删除"
+                $cand = $null
+            }
+        }
+
+        if ($cand) {
+            try {
+                Copy-Item $cand $dst -Force -ErrorAction Stop
+                if ((Get-FileHash $dst -Algorithm SHA256).Hash -eq (Get-FileHash $cand -Algorithm SHA256).Hash) {
+                    Ok "  已还原原有 $f  <- $cand"
+                } else {
+                    Warn "  还原 $f 后哈希不符，请手工核对 $dst"
+                }
+            } catch {
+                Warn "  还原 $f 失败：$($_.Exception.Message)"
+            }
+        } else {
+            # 删除时要考虑 KnownDLLs：dwmapi.dll 属于 KnownDLLs，
+            # 覆盖成同名文件通常可行，但删除动作本身可能被系统拒绝（通常表现为"文件正在使用"）。
+            try {
+                # 认不出来的同名文件先归档再删：删除动作通常是安全的（Steam 会回落到
+                # system32 的系统库），但"备份"是这里唯一不可逆的一步，所以先落盘。
+                $keep = Join-Path $BACKUP_ROOT "removed-$stamp"
+                New-Item -ItemType Directory -Force -Path $keep | Out-Null
+                Copy-Item $dst (Join-Path $keep $f) -Force -ErrorAction SilentlyContinue
+                Remove-Item $dst -Force -ErrorAction Stop
+                Say "  已删除 $f（原件已归档到 $keep；Steam 将回落到 system32 的系统库）"
+            } catch {
+                Warn "  删除 $f 失败：$($_.Exception.Message)"
+                Warn "  请手动删除，或重启后重试：$dst"
+            }
+        }
+    }
+}
+
 function Do-Uninstall([string]$root) {
     Say '开始卸载 ...'
-    Stop-SteamProcesses $root | Out-Null
+    if ($DryRun) {
+        Warn '[DryRun] 仅列出将删除的内容，不做任何改动'
+    }
+    if (-not $DryRun) { Stop-SteamProcesses $root | Out-Null }
+
+    # 取最近一次安装留下的备份目录，作为组件还原的优先来源
+    $latest = ''
+    $dirs = @(Get-ChildItem $BACKUP_ROOT -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name -Descending)
+    if ($dirs.Count -gt 0) { $latest = $dirs[0].Name }
 
     $removed = 0
-    foreach ($f in $DLL_SHA.Keys) {
-        $p = Join-Path $root $f
-        if (Test-Path $p) { Remove-Item $p -Force; Say "  已删除 $f"; $removed++ }
+    if ($DryRun) {
+        foreach ($f in $DLL_SHA.Keys) {
+            if (Test-Path (Join-Path $root $f)) { Say "  [DryRun] 将处理 $f" }
+        }
+    } else {
+        # 组件的备份、还原、删除统一在这一处完成（含哈希判定），不做循环调用
+        Restore-SteamComponents $root $latest | Out-Null
+        $removed += $DLL_SHA.Keys.Count
     }
     foreach ($d in @('opensteamtool', 'config\lua')) {
         $p = Join-Path $root $d
-        if (Test-Path $p) { Remove-Item $p -Recurse -Force; Say "  已删除 $d\"; $removed++ }
+        if (Test-Path $p) {
+            if ($DryRun) { Say "  [DryRun] 将删除 $d\" }
+            else { Remove-Item $p -Recurse -Force; Say "  已删除 $d\"; $removed++ }
+        }
     }
     $toml = Join-Path $root 'opensteamtool.toml'
-    if (Test-Path $toml) { Remove-Item $toml -Force; Say '  已删除 opensteamtool.toml'; $removed++ }
+    if (Test-Path $toml) {
+        if ($DryRun) { Say '  [DryRun] 将删除 opensteamtool.toml' }
+        else { Remove-Item $toml -Force; Say '  已删除 opensteamtool.toml'; $removed++ }
+    }
 
     # 清理各账号的库缓存，避免库里继续显示解锁游戏
     $ud = Join-Path $root 'userdata'
@@ -399,14 +600,25 @@ function Do-Uninstall([string]$root) {
             if (Test-Path $lc) {
                 Get-ChildItem $lc -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object {
                     $c = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
-                    $c -match '"appid"\s*:\s*"?\d+' -and $c.Length -lt 4096
+                    if (-not $c) { return $false }
+                    # 只清掉"仅含单个 appid 的解锁占位文件"。本工具确实会写入
+                    # 这种小文件，但这个判据同样是启发式的：体积阈值 4 KB 既可能
+                    # 漏掉更大的占位文件，理论上也可能误伤正常的小缓存。
+                    # 需要确定性清理时请手工核对 $lc 下的 json。
+                    return ($c.Length -lt 4096 -and
+                            $c -match '"appid"\s*:\s*"?\d+' -and
+                            $c -notmatch '"apps"\s*:\s*\[')
                 } | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
             }
         }
     }
 
-    Ok "卸载完成，共处理 $removed 项"
+    Ok "卸载完成，共处理 $removed 项（组件、lua、toml、库缓存）"
     Say "备份保留在: $BACKUP_ROOT"
+    Say '以下内容没有被自动清理，确认无用后可手工删除：'
+    Say "  · $root\appcache\librarycache\<appid>  （Steam 下载的库封面）"
+    Say "  · $root\depotcache                     （已下载的 manifest 缓存）"
+    Say '  · userdata 下各账号的 librarycache json 可能有残留'
     return $true
 }
 
@@ -422,6 +634,17 @@ Ok "Steam 目录: $steam"
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 if ($Uninstall) { Do-Uninstall $steam | Out-Null; return }
+
+# 预检：管理员权限 / 剩余空间 / 安全软件排除项
+$isAdmin = $false
+try {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+if (-not $isAdmin) {
+    Warn '当前不是管理员权限：写入 Steam 目录可能失败；被安全软件拦截时也无法自动处理。'
+    Warn '若下一步出现"拒绝访问"，请重开一个管理员 PowerShell 再跑本命令。'
+}
 
 # 取 AppID：参数 -> 环境变量 -> 交互输入
 if ($AppId -le 0 -and $env:OST_APPID) {
@@ -459,19 +682,59 @@ if (-not $Yes) {
 
 Write-Host ''
 Say '正在关闭 Steam ...'
-if (-not (Stop-SteamProcesses $steam)) { Warn '部分文件仍被占用，继续尝试写入' }
-Ok 'Steam 已停止'
+if ($DryRun) {
+    Warn '[DryRun] 跳过关闭 Steam'
+} else {
+    if (-not (Stop-SteamProcesses $steam)) { Warn '部分文件仍被占用，继续尝试写入' }
+    Ok 'Steam 已停止'
+}
 
 Write-Host ''
 Say '准备组件 ...'
 if (-not (Install-Components $steam $stamp)) { Fail '组件准备失败，已中止（原有文件未改动）'; return }
 
-Write-Host ''
 Write-Config $steam $stamp | Out-Null
 
 Write-Host ''
 Say '解析 depot 结构 ...'
 $depots = Get-DepotPlan $AppId
+
+# appinfo 返回的是"当前 public 分支"的 depots，通常覆盖主体内容。
+# 体积用于磁盘预检，同时给覆盖率判断一个参考。
+$sizeMap = @{}
+foreach ($d in $depots) { $sizeMap["$($d.Id)"] = [int64]$d.Size }
+$totalBytes = ($depots | Measure-Object -Property Size -Sum).Sum
+if ($totalBytes -gt 0) {
+    Say ("  本体 depot 合计 {0:N1} GB（{1} 个）——这是各平台/语言 depot 的总和，不是真实下载量" -f ($totalBytes/1GB), $depots.Count)
+    if ($KNOWN_SIZE[[int]$AppId]) { Say ("  该 AppID 实测下载量 {0:N1} GB（见 `$KNOWN_SIZE 表）" -f $KNOWN_SIZE[[int]$AppId]) }
+}
+
+# 磁盘预检：只提示、不阻断。装到哪块盘由用户在 Steam 里决定，
+# 这里负责把"装不下"提前说清楚，避免下到一半失败。
+if ($totalBytes -gt 0) {
+    $known = $KNOWN_SIZE[[int]$AppId]
+    if ($known) {
+        $need = [int64]($known * 1GB)
+        $srcTxt = "该游戏实测下载量 {0:N1} GB" -f $known
+    } else {
+        # 未知游戏：depot 求和通常远大于真实下载量，取 1/4 作下限粗判
+        $need = [int64]($totalBytes * 0.25)
+        $srcTxt = "depot 合计 {0:N1} GB（按 1/4 粗估）" -f ($totalBytes/1GB)
+    }
+    $dp = Get-DiskPrecheck $steam $need
+    if ($dp) {
+        if ($dp.Ok) {
+            Ok ("磁盘预检: $($dp.Drive)\ 剩余 {0:N1} GB，{1}，空间充裕" -f ($dp.Free/1GB), $srcTxt)
+        } elseif ($dp.AnyRootOk) {
+            Warn ("默认库 $($dp.Drive)\ 剩余 {0:N1} GB 偏紧（{1}）。" -f ($dp.Free/1GB), $srcTxt)
+            Warn '其他库位置空间更充裕，可在 Steam 里选择装到别的盘。'
+        } else {
+            Warn ("磁盘空间不足：$($dp.Drive)\ 剩余 {0:N1} GB，{1}。" -f ($dp.Free/1GB), $srcTxt)
+            Warn '现在开始下载很可能中途失败。库位置：' + ($dp.Roots -join ' | ')
+            if (-not (Ask-Continue '磁盘空间不足')) { Say '已取消（配置未改动）'; return }
+        }
+    }
+}
 
 # 收集 DLC。DLC 的 appid 必须显式 addappid，否则 Steam 不认为你拥有它；
 # 而其 depot 有时挂在本体下、有时独立，两种都要覆盖。
@@ -483,12 +746,17 @@ try {
 } catch { }
 if ($dlcIds.Count -gt 0) {
     Say "检测到 $($dlcIds.Count) 个 DLC，纳入其 app 声明与独立 depot ..."
+    # 每个 DLC 查一次 appinfo，下面取密钥时复用，避免同一接口请求两遍
+    $dlcPlans = @{}
     foreach ($dlcId in $dlcIds) {
         $dlcDepots = Get-DepotPlan ([int]$dlcId)
+        $dlcPlans["$dlcId"] = $dlcDepots
         $added = 0
         foreach ($d in $dlcDepots) {
             if (-not ($depots | Where-Object { "$($_.Id)" -eq "$($d.Id)" })) {
                 $depots += $d
+                $sizeMap["$($d.Id)"] = [int64]$d.Size
+                $totalBytes += [int64]$d.Size
                 $added++
             }
         }
@@ -507,8 +775,8 @@ $keyInfo = Get-DepotKeys $AppId $depots
 # DLC 若带独立 depot，其密钥可能在 DLC 自己的分支下，逐个补取
 if ($dlcIds.Count -gt 0) {
     foreach ($dlcId in $dlcIds) {
-        $dlcDepots2 = Get-DepotPlan ([int]$dlcId)
-        if ($dlcDepots2.Count -eq 0) { continue }
+        $dlcDepots2 = $dlcPlans["$dlcId"]
+        if (-not $dlcDepots2 -or $dlcDepots2.Count -eq 0) { continue }
         $dk = Get-DepotKeys ([int]$dlcId) $dlcDepots2
         if (-not $dk) { continue }
         if (-not $keyInfo) {
@@ -534,7 +802,11 @@ $plan = $depots
 if ($keyInfo -and $depots.Count -gt 0) {
     $plan = @($depots | Where-Object { $keyInfo.Keys.ContainsKey("$($_.Id)") })
     if ($plan.Count -eq 0) {
-        Warn '过滤后无可用 depot，回退为声明全部'
+        # 一个密钥都没有时，"回退为声明全部"只会让 Steam 挂载一堆无法解密的
+        # depot，表现是安装大小 0 B / 直接失败，比什么都不写更糟。
+        Fail '本体与 DLC 的所有 depot 都没有拿到解密密钥，本 AppID 未被任何公开库收录。'
+        Warn '继续下去只会写入一个无效配置。若要强行尝试（仅用于实验），请加 -Yes 重跑。'
+        if (-not ($Yes -or $DryRun)) { Say '已中止（配置未改动）'; return }
         $plan = $depots
     }
     elseif ($plan.Count -lt $depots.Count) {
@@ -546,6 +818,10 @@ Write-Host ''
 Write-Lua $steam $AppId $plan $keyInfo $stamp $dlcIds | Out-Null
 
 Write-Host ''
+if ($DryRun) {
+    Warn '[DryRun] 到此为止：未下载组件、未写任何文件、未启动 Steam'
+    return
+}
 if ($NoRestart) {
     Warn '按 -NoRestart 要求，未启动 Steam。手动启动后配置生效。'
 } else {
