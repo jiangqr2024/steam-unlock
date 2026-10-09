@@ -941,23 +941,18 @@ if ($totalBytes -gt 0) {
         $need = [int64]($totalBytes * 0.25)
         $srcTxt = "depot 合计 {0:N1} GB（按 1/4 粗估）" -f ($totalBytes/1GB)
     }
-    $dp = Get-DiskPrecheck $steam $need
-    if ($dp) {
-        $needGb = [math]::Round($need / 1GB, 1)
-        if ($dp.Ok) {
-            Write-Log ("disk ok: free {0:N1} GB vs need {1:N1} GB on {2}" -f ($dp.Free/1GB), $needGb, $dp.Drive)
-        } elseif ($dp.AnyRootOk) {
-            Warn ("$($dp.Drive)\ 只剩 {0:N1} GB，这个游戏要装 {1:N1} GB。" -f ($dp.Free/1GB), $needGb)
-            Nice '你还有别的库位置空间够用，在 Steam 里选那个盘安装就行。'
-        } else {
-            Warn ("磁盘空间不够：$($dp.Drive)\ 只剩 {0:N1} GB，这个游戏要装 {1:N1} GB。" -f ($dp.Free/1GB), $needGb)
-            Nice ('可以清理一些空间，或者在 Steam 里换个盘装。库位置：' + ($dp.Roots -join ' / '))
-            if (-not (Ask-Continue '磁盘空间不足')) {
-                Stop-WithUserMessage 'E-DISK-FULL' "user declined at disk precheck (free $($dp.Free))"
-                return
-            }
-        }
+$dp = Get-DiskPrecheck $steam $need
+if ($dp) {
+    $needGb = [math]::Round($need / 1GB, 1)
+    if ($dp.Ok) {
+        Write-Log ("disk ok: free {0:N1} GB vs need {1:N1} GB on {2}" -f ($dp.Free/1GB), $needGb, $dp.Drive)
+    } else {
+        # 入库和下载是两件事：这一步只让游戏出现在库里，不占任何空间。
+        # 空间不足只提醒、不阻断 —— 完全可以先入库，等腾出空间再点安装。
+        Warn ("这个游戏装完约 {0:N1} GB，$($dp.Drive)\ 现在只剩 {1:N1} GB。" -f $needGb, ($dp.Free/1GB))
+        Nice '不影响入库。想玩的时候在 Steam 里点安装就行。'
     }
+}
 }
 
 # 收集 DLC。DLC 的 appid 必须显式 addappid，否则 Steam 不认为你拥有它；
