@@ -439,6 +439,60 @@ function Get-DepotPlan([int]$id) {
     return $list
 }
 
+# 下载一个文件（支持 gzip）。不用 Invoke-WebRequest 的 -OutFile：
+# 它在 PS 5.1 下会按文本解码，二进制压缩包会被破坏。
+function Download-File([string]$url, [string]$dest, [int]$timeoutSec, [switch]$Gzip) {
+    try {
+        $hc = New-Object System.Net.Http.HttpClient
+        $hc.Timeout = [TimeSpan]::FromSeconds($timeoutSec)
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
+        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'ost-install')
+        $resp = $hc.SendAsync($req).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) { return $false }
+        $st = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        if ($Gzip) { $st = New-Object System.IO.Compression.GZipStream($st, [IO.Compression.CompressionMode]::Decompress) }
+        $fs = [IO.File]::Create($dest)
+        try { $st.CopyTo($fs) } finally { $fs.Close(); $st.Close(); $hc.Dispose() }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# 全局 depot 密钥表：优先从自有域名取（国内可达性稳定），GitHub 只作备用。
+# 这张表覆盖面最大（实测 288,313 条、其中 175,781 条有效），一个游戏里
+# 镜像补不齐的 depot，通常都能在这里找到，所以它的可用性直接决定成不成。
+function Get-GlobalKeyTable([string]$cache) {
+    $srcs = @(
+        @{ u = "$API_BASE/depotkeys.json.gz"; g = $true;  n = 'self-hosted (gzip)' },
+        @{ u = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'; g = $false; n = 'github raw' }
+    )
+    foreach ($s in $srcs) {
+        $raw = Join-Path $env:TEMP ('ost-keys-' + (Get-Random) + '.json')
+        $ok = $false
+        # 实测：这张表 7 MB，从自有域名下完要 4-5 分钟（国内线路限速）。
+        # 但它是一次性的 —— 下完缓存 7 天，之后所有游戏都不用再下。
+        # 所以超时给足，宁可慢也不要半途失败重来。
+        if ($s.g) { $ok = Download-File $s.u $raw 600 -Gzip } else { $ok = Download-File $s.u $raw 600 }
+        if (-not $ok -or -not (Test-Path $raw)) {
+            Write-Log ("global key table: source failed - " + $s.n) 'WARN'
+            continue
+        }
+        $sizeMb = [math]::Round((Get-Item $raw).Length / 1MB, 1)
+        try {
+            $t = Get-Content $raw -Raw | ConvertFrom-Json
+            try { Copy-Item $raw $cache -Force } catch { }
+            Write-Log ("global key table: loaded from " + $s.n + " ($sizeMb MB)")
+            Remove-Item $raw -Force -ErrorAction SilentlyContinue
+            return $t
+        } catch {
+            Write-Log ("global key table: parse failed from " + $s.n) 'WARN'
+            Remove-Item $raw -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $null
+}
+
 function Get-DepotKeys([int]$id, $needDepots) {
     # 遍历多个镜像取并集：各仓库收录的 depot 并不一致，单个仓库常缺关键密钥。
     # 一旦 appinfo 里列出的 depot 全部有密钥就提前停止，避免无谓请求。
@@ -480,54 +534,44 @@ function Get-DepotKeys([int]$id, $needDepots) {
     # 兜底：SteamAutoCracks/ManifestHub 的 depotkeys.json 是 depotId -> key 的
     # 全局映射表（实测 288381 条），覆盖面远超任何单仓库。代价是 16 MB，
     # 所以只在前面所有镜像仍未能凑齐时下载一次。
-    if ($needDepots -and @($needDepots).Count -gt 0) {
+if ($needDepots -and @($needDepots).Count -gt 0) {
         $stillMissing = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
         if ($stillMissing.Count -gt 0) {
             Write-Log ("{0} depot(s) still missing; consulting the global key table" -f $stillMissing.Count)
-            try {
-                $globalUrl = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'
-                # 缓存路径不能建立在 $PSScriptRoot 上：install.ps1 在 irm|iex 场景里没有
-                # 脚本文件上下文，这个变量是空的。整个 try 块又没有 catch，异常会沿着
-                # 外层 catch 被吞掉 —— 结果就是"看起来有缓存，实际永远不命中"。
-                $cacheDir = Join-Path $env:LOCALAPPDATA 'ost-cache'
-                $cache = Join-Path $cacheDir 'depotkeys.json'
-                $gj = $null
-                if ((Test-Path $cache) -and (((Get-Date) - (Get-Item $cache).LastWriteTime).TotalDays -lt 7)) {
-                    try {
-                        $gj = Get-Content $cache -Raw | ConvertFrom-Json
-                        Write-Log 'using cached global key table (within 7 days)'
-                    } catch { $gj = $null; Warn '    本地缓存损坏，改为重新下载' }
-                }
-                if (-not $gj) {
-                    # 先落原始文件再解析：避免 PS 的 ConvertTo-Json/ConvertFrom-Json
-                    # 往返在这张 28 万条目的表上引入任何差异。
-                    $rawTmp = Join-Path $env:TEMP ('ost-depotkeys-' + (Get-Random) + '.json')
-                    Invoke-WebRequest -Uri $globalUrl -OutFile $rawTmp -UseBasicParsing -TimeoutSec 180
-                    try {
-                        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-                        Copy-Item $rawTmp $cache -Force
-                        Write-Log "cached global key table -> $cache"
-                    } catch { Warn "    缓存写入失败（不影响本次运行）: $($_.Exception.Message)" }
-                    $gj = Get-Content $rawTmp -Raw | ConvertFrom-Json
-                    Remove-Item $rawTmp -Force -ErrorAction SilentlyContinue
-                }
-                $gained = 0
+            # 缓存路径不能建立在 $PSScriptRoot 上：install.ps1 在 irm|iex 场景里
+            # 没有脚本文件上下文，那个变量是空的，整个 try 会被外层 catch 吞掉。
+            $cacheDir = Join-Path $env:LOCALAPPDATA 'ost-cache'
+            $cache = Join-Path $cacheDir 'depotkeys.json'
+            if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null }
+            $gj = $null
+            if ((Test-Path $cache) -and (((Get-Date) - (Get-Item $cache).LastWriteTime).TotalDays -lt 7)) {
+                try {
+                    $gj = Get-Content $cache -Raw | ConvertFrom-Json
+                    Write-Log 'using cached global key table (within 7 days)'
+                } catch { $gj = $null; Write-Log 'local key cache corrupt; refetching' 'WARN' }
+            }
+            if (-not $gj) {
+                # 第一次跑某个游戏时可能要下这张表（约 7 MB），慢但只此一次。
+                Step '正在准备游戏数据（首次较慢，之后会快）...' 'keytable'
+                $gj = Get-GlobalKeyTable $cache
+            }
+            $gained = 0
+            if ($gj) {
                 foreach ($d in $stillMissing) {
                     $prop = $gj.PSObject.Properties | Where-Object { $_.Name -eq [string]$d.Id }
                     if ($prop) {
                         $v = [string]$prop.Value
-                        # 全局表里有空值条目，必须校验格式
+                        # 表里有空值条目，必须校验格式
                         if ($v -match '^[0-9a-fA-F]{64}$') {
                             $all[[string]$d.Id] = $v.ToLower()
                             $gained++
                         }
                     }
                 }
-                if ($gained -gt 0) { [void]$srcs.Add("SteamAutoCracks/ManifestHub/depotkeys.json (+$gained)") }
-            } catch { }
+            }
+            if ($gained -gt 0) { [void]$srcs.Add("global key table (+$gained)") }
         }
     }
-
     if ($all.Count -eq 0) { return $null }
     return [pscustomobject]@{ Keys = $all; Sources = $srcs }
 }
