@@ -39,7 +39,21 @@ $INSTALL_SHA = 'E371C34FEE00BADEBAEC44448D3CF9E693BB826433282218D2C14013C9D45708
 # copy for a few minutes after a push, so the first mirror can legitimately
 # return a stale build. The loop below treats a hash mismatch as "this source
 # is stale" and moves on - it does not abort.
+# Source order, and why it is what it is:
+#   1) our own Pages domain  - the ONE channel we control, and the only place that
+#                              is guaranteed to hold the current install.ps1 right
+#                              after a release. Measured from a mainland-China line
+#                              without any proxy: reachable.
+#   2) direct raw.github      - fastest when it works, but it is blocked on many
+#                              mainland lines (measured: 20s timeout, zero bytes).
+#   3) GitHub proxies         - usually reachable, but they cache, so right after a
+#                              release they may still hand back the previous build.
+#   4) jsDelivr mirrors       - reachable, but cache branch content for ~12 hours,
+#                              so they lag the most after a release.
+# The hash check below means a stale source is skipped rather than trusted, so
+# putting our own domain first costs nothing and fixes the common failure.
 $SRCS = @(
+    'https://jiangqr2026.xyz/install.ps1',
     $RAW,
     'https://gh-proxy.com/' + $RAW,
     'https://ghproxy.net/' + $RAW,
