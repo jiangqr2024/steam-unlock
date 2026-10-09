@@ -76,6 +76,23 @@ Write-Host "[+] Saved to    : $DST" -ForegroundColor Green
 Write-Host "[+] Size        : $sz bytes" -ForegroundColor Green
 Write-Host "[+] SHA256      : $h" -ForegroundColor Green
 Write-Host ''
+# ---- install.ps1 integrity check ----
+# Why this exists: this script feeds install.ps1 to iex. iex is not bound by
+# ExecutionPolicy, which is exactly why it works on locked-down machines - and
+# also why a swapped install.ps1 would go unnoticed. So the expected hash is
+# pinned here. Maintain it with sync-hashes.ps1 BEFORE uploading.
+# Fix: stop, save the file the mirror gave you, compare its hash, and check:
+#      https://github.com/jiangqr2024/steam-unlock/issues
+$INSTALL_SHA = '5C7FC1E4E77E77ED92B16650028F56F48BC2898734805D71E8BD6621105C7442'
+if ($h -ne $INSTALL_SHA) {
+    Write-Host ''
+    Write-Host '[x] install.ps1 SHA256 mismatch - NOT running it.' -ForegroundColor Red
+    Write-Host '    expected: ' -NoNewline -ForegroundColor Red; Write-Host $INSTALL_SHA -ForegroundColor Red
+    Write-Host '    got     : ' -NoNewline -ForegroundColor Red; Write-Host $h -ForegroundColor Red
+    Write-Host '    The file is kept at the path above for inspection.' -ForegroundColor Yellow
+    return
+}
+
 Write-Host 'Want to read it before running?' -ForegroundColor Yellow
 Write-Host "  notepad `"$DST`"" -ForegroundColor Yellow
 Write-Host ''
