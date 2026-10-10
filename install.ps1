@@ -881,16 +881,7 @@ Write-Log "dryrun: $DryRun  yes: $Yes  norestart: $NoRestart"
 
 if ($Uninstall) { Do-Uninstall $steam | Out-Null; return }
 
-# 预检：管理员权限 / 剩余空间 / 安全软件排除项
-$isAdmin = $false
-try {
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
-} catch { }
-if (-not $isAdmin) {
-    Warn '建议用管理员身份运行，否则可能写不进 Steam 目录。'
-    Write-Log 'not running as administrator'
-}
+
 
 # 取 AppID：参数 -> 环境变量 -> 交互输入
 if ($AppId -le 0 -and $env:OST_APPID) {
@@ -1163,6 +1154,5 @@ Write-Host ''
 Write-Host '  完成了。打开 Steam，游戏会出现在库中。' -ForegroundColor Green
 Write-Host '  库里暂时没有的话，等 1-2 分钟（Steam 刷新库有延迟），或者重启一次 Steam。'
 Write-Host ''
-Write-Host '  卸载：再跑一次命令，把最后的数字换成 -Uninstall'
-Write-Host ('  日志：' + $script:LOGPATH) -ForegroundColor DarkGray
+
 Write-Host ''
