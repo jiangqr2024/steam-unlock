@@ -24,7 +24,9 @@ param(
     [switch]$Uninstall,
     [switch]$NoRestart,
     [switch]$Yes,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$LibraryOnly,
+    [string]$ComponentZip
 )
 
 $ErrorActionPreference = 'Stop'
@@ -161,24 +163,73 @@ $script:ERRORS = @{
 # 失败出口：所有失败都必须走这里，保证"一句话结论 + 一个动作"。
 # 细节不进 console —— 用户在装游戏，不想看堆栈；但它们会进日志，且尾部随错误一起打出来。
 function Stop-WithUserMessage {
-    param([string]$Code, [string]$Detail, [int]$ExitCode = 1)
+    param([string]$Code, [string]$Detail)
     $e = $script:ERRORS[$Code]
     if (-not $e) { $e = $script:ERRORS['E-UNKNOWN']; $Code = 'E-UNKNOWN' }
     if ($Detail) { Write-Log ("detail: " + $Detail) 'ERROR' }
 
     Write-Host ''
-    Write-Host ('  出错了，已经停下来（' + $e.T + '）') -ForegroundColor Red
+    Write-Host ('x 安装中止：' + $e.T) -ForegroundColor Red
     Write-Host ('  ' + $e.A)
-    if ($e.R) { Write-Host '  修好之后，直接用同样的命令再跑一次就行。' -ForegroundColor DarkGray }
-    Write-Host ('  错误码 ' + $Code) -ForegroundColor DarkGray
-    if ($script:LOGPATH) { Write-Host ('  日志 ' + $script:LOGPATH) -ForegroundColor DarkGray }
+    $meta = '  错误码 ' + $Code
+    if ($script:LOGPATH) { $meta += '    日志 ' + $script:LOGPATH }
+    Write-Host $meta -ForegroundColor DarkGray
     if ($script:LOGTAIL.Count -gt 0) {
-        Write-Host '  ---- 下面这段发给我 ----' -ForegroundColor DarkGray
+        Write-Host '  ---- 诊断信息 ----' -ForegroundColor DarkGray
         foreach ($l in $script:LOGTAIL) { Write-Host ('  ' + $l) -ForegroundColor DarkGray }
     }
     Write-Host ''
-    if (-not $DryRun) { try { exit $ExitCode } catch { return } }
-    return
+    throw "[$Code] $Detail"
+}
+
+# 记录本工具实际改写的文件。首次改写时保存原件；重复安装不覆盖这份原件。
+function Save-InstallState {
+    $json = $script:INSTALL_STATE | ConvertTo-Json -Depth 6
+    $tempState = "$script:STATE_PATH.tmp"
+    [IO.File]::WriteAllText($tempState, $json, (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tempState -Destination $script:STATE_PATH -Force
+}
+
+function Initialize-InstallState([string]$root) {
+    $normalized = [IO.Path]::GetFullPath($root).TrimEnd('\').ToLowerInvariant()
+    $bytes = [Text.Encoding]::UTF8.GetBytes($normalized)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $id = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').Substring(0, 16) }
+    finally { $sha.Dispose() }
+    $script:STATE_PATH = Join-Path $BACKUP_ROOT "state-$id.json"
+    $script:ORIGINAL_DIR = Join-Path $BACKUP_ROOT "originals-$id"
+    if (Test-Path $script:STATE_PATH) {
+        $script:INSTALL_STATE = Get-Content $script:STATE_PATH -Raw | ConvertFrom-Json
+        if ($script:INSTALL_STATE.Root -ne $normalized) { throw '安装记录与 Steam 路径不符' }
+    } else {
+        $script:INSTALL_STATE = [pscustomobject]@{ Root = $normalized; Files = @() }
+    }
+}
+
+function Get-TrackedFile([string]$relative) {
+    @($script:INSTALL_STATE.Files | Where-Object { $_.Path -eq $relative }) | Select-Object -First 1
+}
+
+function Track-FileBeforeWrite([string]$root, [string]$relative) {
+    if (Get-TrackedFile $relative) { return }
+    $target = Join-Path $root $relative
+    $existed = Test-Path -LiteralPath $target -PathType Leaf
+    $backup = ''
+    if ($existed) {
+        New-Item -ItemType Directory -Force -Path $script:ORIGINAL_DIR | Out-Null
+        $backup = Join-Path $script:ORIGINAL_DIR ([guid]::NewGuid().ToString('N'))
+        Copy-Item -LiteralPath $target -Destination $backup -ErrorAction Stop
+    }
+    $record = [pscustomobject]@{ Path = $relative; Existed = $existed; Backup = $backup; InstalledHash = '' }
+    $script:INSTALL_STATE.Files = @($script:INSTALL_STATE.Files) + $record
+    Save-InstallState
+}
+
+function Track-FileAfterWrite([string]$root, [string]$relative) {
+    $record = Get-TrackedFile $relative
+    if (-not $record) { throw "缺少安装记录: $relative" }
+    $record.InstalledHash = (Get-FileHash -LiteralPath (Join-Path $root $relative) -Algorithm SHA256).Hash
+    Save-InstallState
 }
 
 function Get-SteamRoot {
@@ -300,9 +351,19 @@ function Install-Components([string]$root, [string]$stamp) {
     $zip = "$tmp.zip"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
-    Say "下载官方 Release（约 $REL_MB MB）: $REL_ZIP"
+    $localZip = $ComponentZip
+    if (-not $localZip -and $PSScriptRoot) {
+        $bundled = Join-Path $PSScriptRoot "OpenSteamTool-$REL_TAG-Release.zip"
+        if (Test-Path -LiteralPath $bundled -PathType Leaf) { $localZip = $bundled }
+    }
     try {
-        Invoke-WebRequest -Uri $REL_ZIP -OutFile $zip -UseBasicParsing -TimeoutSec 240
+        if ($localZip) {
+            Copy-Item -LiteralPath $localZip -Destination $zip -Force -ErrorAction Stop
+            Say "使用本地组件包：$localZip"
+        } else {
+            Say "下载官方 Release（约 $REL_MB MB）: $REL_ZIP"
+            Invoke-WebRequest -Uri $REL_ZIP -OutFile $zip -UseBasicParsing -TimeoutSec 240 -ErrorAction Stop
+        }
     } catch {
         Fail "download failed: $($_.Exception.Message)"
         $script:ERRCODE = 'E-COMPONENT-DL'
@@ -335,29 +396,23 @@ function Install-Components([string]$root, [string]$stamp) {
         Write-Log "$f sha256 ok" 'OK'
     }
 
-    # 备份现有同名文件（可能是其他工具的组件）
-    $bk = Join-Path $BACKUP_ROOT $stamp
-    New-Item -ItemType Directory -Force -Path $bk | Out-Null
     foreach ($f in $DLL_SHA.Keys) {
         $dst = Join-Path $root $f
-        if (Test-Path $dst) {
-            Copy-Item $dst (Join-Path $bk $f) -Force
-            Say "已备份原有 $f -> $bk"
-        }
+        Track-FileBeforeWrite $root $f
         try {
             Copy-Item (Join-Path $tmp $f) $dst -Force -ErrorAction Stop
         } catch {
             Fail "write $f failed: $($_.Exception.Message)"
             $script:ERRCODE = 'E-COMPONENT-WRITE'
-            if (-not (Ask-Continue "组件未写入，配置将生成但不会生效")) { return $false }
-            return $true
+            return $false
         }
         # 写入后复校：杀软隔离、磁盘写入错误都会在这里暴露，而不是等到启动 Steam 才失败
         if ((Get-FileHash $dst -Algorithm SHA256).Hash -ne $DLL_SHA[$f]) {
             Fail "$f changed after write (AV quarantine or tampering)"
             $script:ERRCODE = 'E-COMPONENT-BLOCK'
-            if (-not (Ask-Continue '该组件哈希校验失败')) { return $false }
+            return $false
         }
+        Track-FileAfterWrite $root $f
     }
 
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
@@ -374,12 +429,7 @@ function Write-Config([string]$root, [string]$stamp) {
         return $true
     }
 
-    if (Test-Path $toml) {
-        $bk = Join-Path $BACKUP_ROOT $stamp
-        New-Item -ItemType Directory -Force -Path $bk | Out-Null
-        Copy-Item $toml (Join-Path $bk 'opensteamtool.toml') -Force
-        Say '已备份原有 opensteamtool.toml'
-    }
+    Track-FileBeforeWrite $root 'opensteamtool.toml'
 
     $body = @"
 # OpenSteamTool 配置 — 由自建安装脚本生成
@@ -406,6 +456,7 @@ enabled = false
 "@
     # 同样必须无 BOM：BOM 不是合法 TOML 起始字符
     [System.IO.File]::WriteAllText($toml, $body, (New-Object System.Text.UTF8Encoding($false)))
+    Track-FileAfterWrite $root 'opensteamtool.toml'
     Ok '已写入 opensteamtool.toml'
 }
 
@@ -636,6 +687,11 @@ if ($needDepots -and @($needDepots).Count -gt 0) {
     return [pscustomobject]@{ Keys = $all; Sources = $srcs }
 }
 
+function Get-UsableDepotPlan($depots, $keyInfo) {
+    if (-not $keyInfo) { return @() }
+    return @($depots | Where-Object { $keyInfo.Keys.ContainsKey("$($_.Id)") })
+}
+
 function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $extraApps) {
     $luaDir = Join-Path $root 'config\lua'
     if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $luaDir | Out-Null }
@@ -680,19 +736,17 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
     $target = Join-Path $luaDir "$id.lua"
     if ($DryRun) {
         Write-Log "[DryRun] would write $luaDir\$id.lua"
-        Nice ("离线检查通过：{0} 个内容包，其中 {1} 个已配好密钥。" -f @($depots).Count, $withKey)
+        if (@($depots).Count -eq 0) { Nice "只入库模式：将生成 addappid($id)，无需查询游戏数据。" }
+        else { Nice ("· 预检通过：{0} 个内容包，{1} 个已配密钥" -f @($depots).Count, $withKey) }
         if ($withKey -lt $depots.Count) { Warn ("有 {0} 个内容包没有密钥，这部分内容可能下载不完整。" -f $noKey) }
         return $true
     }
-    if (Test-Path $target) {
-        $bk = Join-Path $BACKUP_ROOT $stamp
-        New-Item -ItemType Directory -Force -Path $bk | Out-Null
-        Copy-Item $target (Join-Path $bk "$id.lua") -Force
-    }
+    Track-FileBeforeWrite $root "config\lua\$id.lua"
     # 必须无 BOM 写入：Lua 解析器不识别 BOM，带 BOM 会让首行变成
     # "\uFEFFaddappid(...)" 从而导致整个脚本解析失败。
     # 注意 PS 5.1 的 Set-Content -Encoding UTF8 会写入 BOM，不能用于此处。
     [System.IO.File]::WriteAllText($target, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    Track-FileAfterWrite $root "config\lua\$id.lua"
 
     Ok "已写入 $target"
     Say "  depot 数: $($depots.Count)（带密钥 $withKey，无密钥 $noKey）"
@@ -702,141 +756,44 @@ function Write-Lua([string]$root, [int]$id, $depots, $keyInfo, [string]$stamp, $
 # 卸载时要处理的组件。优先还原"上一个工具留下的同名文件"，
 # 没有可还原的备份时直接删除——删掉之后 Steam 会回落到 system32 的系统库。
 # 顺序很重要：先备份 -> 再删除，避免把代理 DLL 当成原件拷来拷去。
-function Restore-SteamComponents([string]$root, [string]$stamp, [switch]$Yes) {
-    $bkRoot = Join-Path $BACKUP_ROOT $stamp
-    foreach ($f in $DLL_SHA.Keys) {
-        $dst = Join-Path $root $f
-        if (-not (Test-Path $dst)) { continue }
-
-        $cur = (Get-FileHash $dst -Algorithm SHA256).Hash
-        if ($cur -ne $DLL_SHA[$f]) {
-            Say "  $f 当前内容不是本项目的组件（哈希不符），保持原样不删除"
-            continue
-        }
-
-        # 找最近一次备份里这个文件
-        $cand = $null
-        if (Test-Path $bkRoot) {
-            $p = Join-Path $bkRoot $f
-            if (Test-Path $p) { $cand = $p }
-        }
-        if (-not $cand) {
-            # 同样的原因：iex 场景下 $PSScriptRoot 为空，只能用固定候选路径。
-            # 这里找不到也不会出错，只是少一个还原来源。
-            foreach ($base in @('D:\steam-unlock-cli')) {
-                $p = Join-Path $base "backup\original-steam-dlls\$f"
-                if (Test-Path $p) { $cand = $p; break }
-            }
-        }
-        if (-not $cand) {
-            $dirs = @(Get-ChildItem $BACKUP_ROOT -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-            foreach ($d in $dirs) {
-                $p = Join-Path $d.FullName $f
-                if (Test-Path $p) { $cand = $p; break }
-            }
-        }
-
-        if ($cand) {
-            $bh = (Get-FileHash $cand -Algorithm SHA256).Hash
-            if ($bh -eq $DLL_SHA[$f]) {
-                Warn "备份里的 $f 仍是本项目的组件（哈希相同），不可还原，将直接删除"
-                $cand = $null
-            }
-        }
-
-        if ($cand) {
-            try {
-                Copy-Item $cand $dst -Force -ErrorAction Stop
-                if ((Get-FileHash $dst -Algorithm SHA256).Hash -eq (Get-FileHash $cand -Algorithm SHA256).Hash) {
-                    Ok "  已还原原有 $f  <- $cand"
-                } else {
-                    Warn "  还原 $f 后哈希不符，请手工核对 $dst"
-                }
-            } catch {
-                Warn "  还原 $f 失败：$($_.Exception.Message)"
-            }
-        } else {
-            # 删除时要考虑 KnownDLLs：dwmapi.dll 属于 KnownDLLs，
-            # 覆盖成同名文件通常可行，但删除动作本身可能被系统拒绝（通常表现为"文件正在使用"）。
-            try {
-                # 认不出来的同名文件先归档再删：删除动作通常是安全的（Steam 会回落到
-                # system32 的系统库），但"备份"是这里唯一不可逆的一步，所以先落盘。
-                $keep = Join-Path $BACKUP_ROOT "removed-$stamp"
-                New-Item -ItemType Directory -Force -Path $keep | Out-Null
-                Copy-Item $dst (Join-Path $keep $f) -Force -ErrorAction SilentlyContinue
-                Remove-Item $dst -Force -ErrorAction Stop
-                Say "  已删除 $f（原件已归档到 $keep；Steam 将回落到 system32 的系统库）"
-            } catch {
-                Warn "  删除 $f 失败：$($_.Exception.Message)"
-                Warn "  请手动删除，或重启后重试：$dst"
-            }
-        }
-    }
-}
-
 function Do-Uninstall([string]$root) {
-    Say '开始卸载 ...'
-    if ($DryRun) {
-        Warn '[DryRun] 仅列出将删除的内容，不做任何改动'
+    $files = @($script:INSTALL_STATE.Files)
+    if ($files.Count -eq 0) {
+        Warn '没有可验证的安装记录；旧版本写入的文件需手动核对，未作删除。'
+        return $true
     }
-    if (-not $DryRun) { Stop-SteamProcesses $root | Out-Null }
+    if ($DryRun) {
+        foreach ($entry in $files) { Nice "[DryRun] 将处理 $($entry.Path)" }
+        return $true
+    }
+    if (-not (Stop-SteamProcesses $root)) { Warn 'Steam 文件仍被占用，卸载已停止'; return $false }
 
-    # 取最近一次安装留下的备份目录，作为组件还原的优先来源
-    $latest = ''
-    $dirs = @(Get-ChildItem $BACKUP_ROOT -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name -Descending)
-    if ($dirs.Count -gt 0) { $latest = $dirs[0].Name }
-
+    $remaining = New-Object System.Collections.Generic.List[object]
     $removed = 0
-    if ($DryRun) {
-        foreach ($f in $DLL_SHA.Keys) {
-            if (Test-Path (Join-Path $root $f)) { Say "  [DryRun] 将处理 $f" }
-        }
-    } else {
-        # 组件的备份、还原、删除统一在这一处完成（含哈希判定），不做循环调用
-        Restore-SteamComponents $root $latest | Out-Null
-        $removed += $DLL_SHA.Keys.Count
-    }
-    foreach ($d in @('opensteamtool', 'config\lua')) {
-        $p = Join-Path $root $d
-        if (Test-Path $p) {
-            if ($DryRun) { Say "  [DryRun] 将删除 $d\" }
-            else { Remove-Item $p -Recurse -Force; Say "  已删除 $d\"; $removed++ }
-        }
-    }
-    $toml = Join-Path $root 'opensteamtool.toml'
-    if (Test-Path $toml) {
-        if ($DryRun) { Say '  [DryRun] 将删除 opensteamtool.toml' }
-        else { Remove-Item $toml -Force; Say '  已删除 opensteamtool.toml'; $removed++ }
-    }
-
-    # 清理各账号的库缓存，避免库里继续显示解锁游戏
-    $ud = Join-Path $root 'userdata'
-    if (Test-Path $ud) {
-        Get-ChildItem $ud -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8,}$' } | ForEach-Object {
-            $lc = Join-Path $_.FullName 'config\librarycache'
-            if (Test-Path $lc) {
-                Get-ChildItem $lc -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object {
-                    $c = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
-                    if (-not $c) { return $false }
-                    # 只清掉"仅含单个 appid 的解锁占位文件"。本工具确实会写入
-                    # 这种小文件，但这个判据同样是启发式的：体积阈值 4 KB 既可能
-                    # 漏掉更大的占位文件，理论上也可能误伤正常的小缓存。
-                    # 需要确定性清理时请手工核对 $lc 下的 json。
-                    return ($c.Length -lt 4096 -and
-                            $c -match '"appid"\s*:\s*"?\d+' -and
-                            $c -notmatch '"apps"\s*:\s*\[')
-                } | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    foreach ($entry in $files) {
+        $target = Join-Path $root $entry.Path
+        try {
+            if (-not $entry.InstalledHash) { throw '安装未完成，缺少写入后哈希' }
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw '文件已被其他程序删除' }
+            $current = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+            if ($current -ne $entry.InstalledHash) { throw '文件在安装后被修改' }
+            if ($entry.Existed) {
+                if (-not $entry.Backup -or -not (Test-Path -LiteralPath $entry.Backup -PathType Leaf)) { throw '原始备份缺失' }
+                Copy-Item -LiteralPath $entry.Backup -Destination $target -Force -ErrorAction Stop
+                Ok "已还原 $($entry.Path)"
+            } else {
+                Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+                Ok "已删除 $($entry.Path)"
             }
+            $removed++
+        } catch {
+            Warn "保留 $($entry.Path)：$($_.Exception.Message)"
+            [void]$remaining.Add($entry)
         }
     }
-
-    Ok "卸载完成，共处理 $removed 项（组件、lua、toml、库缓存）"
-    Say "备份保留在: $BACKUP_ROOT"
-    Say '以下内容没有被自动清理，确认无用后可手工删除：'
-    Say "  · $root\appcache\librarycache\<appid>  （Steam 下载的库封面）"
-    Say "  · $root\depotcache                     （已下载的 manifest 缓存）"
-    Say '  · userdata 下各账号的 librarycache json 可能有残留'
+    $script:INSTALL_STATE.Files = @($remaining.ToArray())
+    Save-InstallState
+    Ok "卸载完成，处理 $removed 个本工具记录的文件；其余文件保持原样。"
     return $true
 }
 
@@ -859,7 +816,7 @@ if ($env:OST_API_TIMEOUT -and [int]::TryParse($env:OST_API_TIMEOUT, [ref]$null))
 
 # ══ 主流程 ══════════════════════════════════════════════════════
 Write-Host ''
-Write-Host '  Steam 游戏解锁' -ForegroundColor Cyan
+Write-Host 'Steam 游戏解锁' -ForegroundColor Cyan
 Write-Host ''
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -867,9 +824,13 @@ $logDir = Join-Path $env:LOCALAPPDATA 'ost-backup'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $script:LOGPATH = Join-Path $logDir ("run-$stamp.log")
 $script:CANPROMPT = $true
-try { $null = Read-Host -Prompt "" } catch { $script:CANPROMPT = $false }
+try { $script:CANPROMPT = -not [Console]::IsInputRedirected } catch { }
 Write-Log ('interactive prompt available: ' + $script:CANPROMPT)
 
+# 主流程整体包一层：Stop-WithUserMessage 用 throw 中断，而 throw 在 iex 下会把
+# 原始异常和堆栈打到屏幕上（用户不该看到那个）。这里捕获它，只保留已经打印的
+# 友好信息。catch 留空是有意的 —— 错误说明在前面的 Stop-WithUserMessage 里。
+try {
 $steam = Get-SteamRoot
 if (-not $steam) {
     Stop-WithUserMessage 'E-STEAM-NOTFOUND' 'Get-SteamRoot returned null'
@@ -878,6 +839,7 @@ if (-not $steam) {
 Write-Log "steam root: $steam"
 Write-Log "powershell: $($PSVersionTable.PSVersion)"
 Write-Log "dryrun: $DryRun  yes: $Yes  norestart: $NoRestart"
+Initialize-InstallState $steam
 
 if ($Uninstall) { Do-Uninstall $steam | Out-Null; return }
 
@@ -957,62 +919,16 @@ if (-not $Yes -and $script:CANPROMPT) {
     if ($ans -ne 'y' -and $ans -ne 'Y') { Write-Host '  已取消。'; Write-Log 'cancelled by user'; return }
 }
 
-if ($DryRun) {
-    Warn '[DryRun] 跳过关闭 Steam'
+if ($LibraryOnly) {
+    Write-Log 'library-only mode: skipping depot, key, DLC and manifest requests'
+    $depots = @()
+    $dlcIds = @()
+    $keyInfo = $null
+    $plan = @()
 } else {
-    Step '正在连接 Steam 服务...' 'stop-steam'
-    if (-not (Stop-SteamProcesses $steam)) {
-        Write-Log 'some files still locked' 'WARN'
-        if (-not (Ask-Continue 'Steam 没有完全退出，组件可能写不进去')) {
-            Stop-WithUserMessage 'E-STEAM-BUSY' 'user aborted after steam files stayed locked'
-            return
-        }
-    }
-    Step '正在准备游戏组件...' 'components'
-}
-
-if (-not (Install-Components $steam $stamp)) {
-    $c = $script:ERRCODE
-    if (-not $c) { $c = 'E-COMPONENT-WRITE' }
-    Stop-WithUserMessage $c 'Install-Components returned false'
-    return
-}
-
-Write-Host ''
-# 服务端探测放在这里：它同时决定 toml 的 manifest 上游怎么写、短码能不能
-# 解析、要不要接受叫停。只问一次，避免每个功能各探一遍。
-
-# L1：网关可用就走网关，不可用就直连内置上游。探针用一个必然非法的 request
-# code（0），网关会回 400；只要不是 404/5xx 就说明这条路由是活的。
-$manifestBlock = "[manifest]`nurl = `"$MANIFEST_MIRROR`""
-if ($apiInfo) {
-    $gwOk = $false
-    try {
-        $null = Invoke-WebRequest -Uri "$API_BASE/api/manifest/0" -UseBasicParsing `
-                -TimeoutSec $API_TIMEOUT_SEC -ErrorAction Stop
-        $gwOk = $true
-    } catch {
-        $resp = $null
-        if ($_.Exception) { $resp = $_.Exception.Response }
-        if ($resp) {
-            $code = 0
-            try { $code = [int]$resp.StatusCode } catch { }
-            if ($code -eq 400 -or $code -eq 502) { $gwOk = $true }
-        }
-    }
-    if ($gwOk) {
-        $manifestBlock = "[manifest]`nurl_template = `"$API_BASE/api/manifest/%llu`""
-        Write-Log "manifest gateway enabled ($API_BASE)"
-    } else {
-        Write-Log 'manifest gateway probe failed; keeping direct upstream' 'WARN'
-    }
-}
-
-Write-Config $steam $stamp | Out-Null
-
-Step '正在读取游戏信息...' 'gameinfo'
+Step '· 正在读取游戏信息' 'gameinfo'
 Write-Log "resolving depot plan for appid $AppId"
-$depots = Get-DepotPlan $AppId
+$depots = @(Get-DepotPlan $AppId)
 
 # appinfo 返回的是"当前 public 分支"的 depots，通常覆盖主体内容。
 # 体积用于磁盘预检，同时给覆盖率判断一个参考。
@@ -1055,16 +971,16 @@ try {
 } catch { }
 if ($dlcIds.Count -gt 0) {
     Write-Log "dlc detected: $($dlcIds -join ', ')"
-    Nice "这款游戏包含 $($dlcIds.Count) 个 DLC，会一起装好。"
+    Nice "· 检测到 $($dlcIds.Count) 个 DLC，已包含"
     # 每个 DLC 查一次 appinfo，下面取密钥时复用，避免同一接口请求两遍
     $dlcPlans = @{}
     foreach ($dlcId in $dlcIds) {
         $dlcDepots = Get-DepotPlan ([int]$dlcId)
-        $dlcPlans["$dlcId"] = $dlcDepots
+        $dlcPlans["$dlcId"] = @($dlcDepots)
         $added = 0
         foreach ($d in $dlcDepots) {
             if (-not ($depots | Where-Object { "$($_.Id)" -eq "$($d.Id)" })) {
-                $depots += $d
+                $depots = @($depots) + @($d)
                 $sizeMap["$($d.Id)"] = [int64]$d.Size
                 $totalBytes += [int64]$d.Size
                 $added++
@@ -1084,14 +1000,14 @@ if ($depots.Count -eq 0) {
     return
 }
 
-Step '正在取得游戏数据...' 'keys'
+Step '· 正在获取密钥（首次较慢）' 'keys'
 Write-Log 'collecting depot keys from public mirrors'
 $keyInfo = Get-DepotKeys $AppId $depots
 
 # DLC 若带独立 depot，其密钥可能在 DLC 自己的分支下，逐个补取
 if ($dlcIds.Count -gt 0) {
     foreach ($dlcId in $dlcIds) {
-        $dlcDepots2 = $dlcPlans["$dlcId"]
+        $dlcDepots2 = @($dlcPlans["$dlcId"])
         if (-not $dlcDepots2 -or $dlcDepots2.Count -eq 0) { continue }
         $dk = Get-DepotKeys ([int]$dlcId) $dlcDepots2
         if (-not $dk) { continue }
@@ -1112,26 +1028,59 @@ if ($keyInfo) {
     Write-Log 'no key source matched this appid' 'WARN'
 }
 
-# 有密钥源时只声明有密钥的 depot。
-# 无密钥的 depot 强行写进配置会让 Steam 尝试挂载却拿不到解密密钥，进而导致整个 app 安装失败。
-$plan = $depots
-if ($keyInfo -and $depots.Count -gt 0) {
-    $plan = @($depots | Where-Object { $keyInfo.Keys.ContainsKey("$($_.Id)") })
-    if ($plan.Count -eq 0) {
-        # 一个密钥都没有时，"回退为声明全部"只会让 Steam 挂载一堆无法解密的
-        # depot，表现是安装大小 0 B / 直接失败，比什么都不写更糟。
-        Fail 'no depot key available for this appid'
-        if (-not ($Yes -or $DryRun)) {
-            Stop-WithUserMessage 'E-NO-KEYS' "appid $AppId produced 0 usable depots"
-            return
-        }
-        Write-Log 'forcing full depot declaration because -Yes was given' 'WARN'
-        $plan = $depots
+# 只有确实取得密钥的 depot 才能进入最终配置。此检查发生在组件写入之前。
+$plan = @(Get-UsableDepotPlan $depots $keyInfo)
+if ($plan.Count -eq 0) {
+    Fail 'no depot key available for this appid'
+    Stop-WithUserMessage 'E-NO-KEYS' "appid $AppId produced 0 usable depots"
+    return
+}
+if ($plan.Count -lt $depots.Count) {
+    Write-Log ("filtered out {0} depot(s) without keys" -f ($depots.Count - $plan.Count))
+}
+}
+
+if ($DryRun) {
+    Warn '[DryRun] 跳过关闭 Steam'
+} else {
+    Step '· 正在关闭 Steam' 'stop-steam'
+    if (-not (Stop-SteamProcesses $steam)) {
+        Stop-WithUserMessage 'E-STEAM-BUSY' 'Steam files stayed locked'
+        return
     }
-    elseif ($plan.Count -lt $depots.Count) {
-        Write-Log ("filtered out {0} depot(s) without keys" -f ($depots.Count - $plan.Count))
+    Step '· 正在校验组件' 'components'
+}
+if (-not (Install-Components $steam $stamp)) {
+    $c = $script:ERRCODE
+    if (-not $c) { $c = 'E-COMPONENT-WRITE' }
+    Stop-WithUserMessage $c 'Install-Components returned false'
+    return
+}
+
+$manifestBlock = "[manifest]`nurl = `"$MANIFEST_MIRROR`""
+if ($apiInfo) {
+    $gwOk = $false
+    try {
+        $null = Invoke-WebRequest -Uri "$API_BASE/api/manifest/0" -UseBasicParsing `
+                -TimeoutSec $API_TIMEOUT_SEC -ErrorAction Stop
+        $gwOk = $true
+    } catch {
+        $resp = $null
+        if ($_.Exception) { $resp = $_.Exception.Response }
+        if ($resp) {
+            $code = 0
+            try { $code = [int]$resp.StatusCode } catch { }
+            if ($code -eq 400 -or $code -eq 502) { $gwOk = $true }
+        }
+    }
+    if ($gwOk) {
+        $manifestBlock = "[manifest]`nurl_template = `"$API_BASE/api/manifest/%llu`""
+        Write-Log "manifest gateway enabled ($API_BASE)"
+    } else {
+        Write-Log 'manifest gateway probe failed; keeping direct upstream' 'WARN'
     }
 }
+if (-not $LibraryOnly) { Write-Config $steam $stamp | Out-Null }
 
 Write-Host ''
 Write-Lua $steam $AppId $plan $keyInfo $stamp $dlcIds | Out-Null
@@ -1145,14 +1094,18 @@ if ($DryRun) {
 if ($NoRestart) {
     Warn '按 -NoRestart 要求，未启动 Steam。手动启动后生效。'
 } else {
-    Step '正在完成配置...' 'launch'
+    Step '· 正在写入配置' 'launch'
     Start-Process (Join-Path $steam 'Steam.exe')
     Start-Sleep -Seconds 5
 }
 
 Write-Host ''
-Write-Host '  完成了。打开 Steam，游戏会出现在库中。' -ForegroundColor Green
-Write-Host '  库里暂时没有的话，等 1-2 分钟（Steam 刷新库有延迟），或者重启一次 Steam。'
+Write-Host '✓ 配置完成，游戏已加入库中' -ForegroundColor Green
+Write-Host '  若库中未显示，等待 1-2 分钟或重启 Steam' -ForegroundColor DarkGray
 Write-Host ''
 
 Write-Host ''
+
+} catch {
+    # 友好信息已由 Stop-WithUserMessage 打印，这里不再输出任何东西
+}
