@@ -32,7 +32,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
 
 # Expected SHA256 of install.ps1. Maintained only by sync-hashes.ps1.
-$INSTALL_SHA = 'F11488A6A19510603E5465FE68ED75EF3BD6B0F2FC0038A6D0D11ED98EAAA9E9'
+$INSTALL_SHA = '0A13220650F1F62E60A2C83DD8F79B989AEB0291B17CAC790B3048333F02B79F'
 
 # Mirror order: direct raw first (fastest when it is fresh), then GitHub
 # proxies, then jsDelivr. raw.githubusercontent.com keeps serving the previous
@@ -54,6 +54,7 @@ $INSTALL_SHA = 'F11488A6A19510603E5465FE68ED75EF3BD6B0F2FC0038A6D0D11ED98EAAA9E9
 # putting our own domain first costs nothing and fixes the common failure.
 $SRCS = @(
     'https://jiangqr2026.xyz/install.ps1',
+    'https://jiangqr2024.github.io/steam-unlock/install.ps1',
     $RAW,
     'https://gh-proxy.com/' + $RAW,
     'https://ghproxy.net/' + $RAW,
@@ -65,7 +66,7 @@ $DST = Join-Path $env:TEMP 'ost-install.ps1'
 $MIN = 2000
 
 Write-Host ''
-Write-Host '  Downloading installer ...' -ForegroundColor Cyan
+Write-Host '- fetching installer' -ForegroundColor Cyan
 
 $used = $null
 $h = $null
@@ -75,9 +76,9 @@ $sawTooSmall = $false
 $lastErr = ''
 
 foreach ($s in $SRCS) {
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
+    for ($attempt = 1; $attempt -le 1; $attempt++) {
         try {
-            $null = Invoke-WebRequest -Uri $s -OutFile $DST -UseBasicParsing -TimeoutSec 45
+            $null = Invoke-WebRequest -Uri $s -OutFile $DST -UseBasicParsing -TimeoutSec 15
             $sz = (Get-Item $DST).Length
             if ($sz -lt $MIN) { $sawTooSmall = $true; continue }
             $h = (Get-FileHash $DST -Algorithm SHA256).Hash
@@ -117,12 +118,10 @@ if (-not $used) {
     return
 }
 
-Write-Host '  Verified.' -ForegroundColor Green
+Write-Host '- verified' -ForegroundColor Green
 Write-Host ''
-Write-Host '  Want to see what it does first? This file is all of it:' -ForegroundColor DarkGray
-Write-Host ('  notepad "' + $DST + '"') -ForegroundColor DarkGray
-Write-Host ''
-Write-Host '  Installing ...' -ForegroundColor Cyan
+
+Write-Host '- installing' -ForegroundColor Cyan
 Write-Host ''
 
 # Run via iex rather than the call operator "& $script":
