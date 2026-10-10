@@ -32,20 +32,28 @@ irm https://jiangqr2026.xyz/<AppID>|iex
 
 | 文件 | 字节 | 编码 | 作用 |
 |---|---|---|---|
-| `install.ps1` | 54507 | **UTF-8 带 BOM** | 主脚本 |
-| `bootstrap.ps1` | 6144 | **纯 ASCII 无 BOM** | 引导：取回并校验 install.ps1 |
-| `publish-game.ps1` | 14206 | UTF-8 带 BOM | 生成 launcher + 覆盖率诊断 + 上传 |
-| `sync-hashes.ps1` | 5251 | UTF-8 带 BOM | 哈希同步的唯一入口 |
+| `install.ps1` | 51676 | **UTF-8 带 BOM** | 主脚本 |
+| `bootstrap.ps1` | 6137 | **纯 ASCII 无 BOM** | 引导：取回并校验 install.ps1 |
+| `publish-game.ps1` | 14915 | UTF-8 带 BOM | 生成 launcher + 覆盖率诊断 + 上传 |
+| `publish-update.ps1` | 4790 | UTF-8 带 BOM | 发布 bootstrap + install（含哈希自检与回读校验） |
+| `sync-hashes.ps1` | 5298 | UTF-8 带 BOM | 哈希同步的唯一入口 |
+| `lib\github-cred.ps1` | 2205 | UTF-8 带 BOM | 按账号精确读 GitHub 凭据（见 8.4） |
+| `test-install.ps1` | 5238 | 纯 ASCII | 单元验证：解析 install.ps1 的 AST，逐个执行函数并断言 |
+| `build-offline-package.ps1` | 2101 | 纯 ASCII | 打包离线组件包（校验 Release zip 哈希） |
+| `update-launchers.ps1` | 1254 | 纯 ASCII | 批量重写 launcher，并把 bootstrap 哈希写进去 |
 | `depotkeys.json.gz` | 7426120 | 二进制 gzip | 自托管的全局密钥表（175714 条） |
 | `REPORT.md` | 37437 | UTF-8 无 BOM | 独立分析报告（原理、复现步骤） |
+| `MAINTENANCE.md` | 本文件 | UTF-8 无 BOM | 维护文档 |
 | `PROJECT.md` / `HANDOFF.md` / `README.md` | — | UTF-8 无 BOM | 历史文档，参考价值 |
 | `g\<appid>.ps1` | 410-450 | 纯 ASCII 无 BOM | 19 个 launcher |
+
+**改完脚本后先跑 `test-install.ps1`**：它不需要网络、不碰 Steam 目录，纯解析 + 断言，几秒出结果。有回归会当场暴露。
 
 **关键哈希**（改完必须保持一致）：
 
 ```
-install.ps1              F11488A6A19510603E5465FE68ED75EF3BD6B0F2FC0038A6D0D11ED98EAAA9E9
-bootstrap.ps1            97264AF82048F537B4562B96DFBBC2154920A61A6AA2427DF1CFE974FC25A28A
+install.ps1              0A13220650F1F62E60A2C83DD8F79B989AEB0291B17CAC790B3048333F02B79F
+bootstrap.ps1            27932E5083380DAE784418DF18F38ADAC3E9F80CBC102F41D9D682809F604F7E
 bootstrap 内置的期望哈希   = install.ps1 的实际哈希（由 sync-hashes.ps1 保证）
 ```
 
@@ -235,6 +243,11 @@ $b = [IO.File]::ReadAllBytes($path)
 | 13 | `-Compress` 上传失败 400 | `ConvertTo-Json -Compress` 让 payload 格式与平时不同 | 大文件上传不带 `-Compress` |
 | 14 | launcher 中文变乱码 | launcher 必须纯 ASCII，我往里加了中文警告 | 用商店返回的英文原文，不加自造中文 |
 | 15 | `publish-game.ps1` 整体崩 | 双 BOM + 写成无 BOM，两个编码错误叠加 | 从线上重新下载原件恢复 |
+| 15 | `publish-game.ps1` 整体崩 | 双 BOM + 写成无 BOM，两个编码错误叠加 | 从线上重新下载原件恢复 |
+| 16 | **`-DryRun` 中途崩溃 `op_Addition`** | `Get-DepotPlan` 返回 `List`，但只有 1 个元素时 PowerShell **自动展开成标量**，于是 `$depots += $d` 变成两个 PSObject 相加 | 赋值与拼接处统一用 `@()` 包住 |
+| 17 | **失败时屏幕出现异常堆栈** | `Stop-WithUserMessage` 用 `throw` 中断，而 `throw` 在 `iex` 下会把原始异常和 `CategoryInfo` 打到屏幕上 | 主流程整体包一层 `try/catch`，catch 留空（友好信息已在前一步打印） |
+| 18 | **上传一直 404，看不出原因** | 凭据管理器里存着两个 GitHub 账号的 token，`git credential fill` 返回的是**没有本仓库权限**的那个；即使传 `credential.username` 也无效 | 新增 `lib/github-cred.ps1` 按名字精确读，并加推送权限自检 |
+| 19 | 改 `publish-update.ps1` 后文件首行丢了 `#` | 用 here-string 替换时，内容里的 C# 代码和 PowerShell 的引号规则冲突，把注释符吃掉了 | 凭据逻辑抽到独立 `lib/` 文件，避免在脚本里内联 C# |
 
 **共同教训**（这是项目最重要的一条，来自原始交接文档，实测完全成立）：**用假设代替实测**。三次重大误判——说巫师3没入库（其实是 UI 延迟）、说剑星不可行（密钥其实在全局表里）、说黄金树幽影全库都没有（钥匙就在那 16 MB 的 json 里）——都源于扫描范围不够就下结论。
 
@@ -273,13 +286,16 @@ $b = [IO.File]::ReadAllBytes($path)
 ```powershell
 cd D:\steam-unlock-cli\dist-package
 
+# 0) 先跑单元验证（几秒，不需要网络，不碰 Steam 目录）
+.\test-install.ps1
+
 # 1) 干跑验证：确认改动没破坏流程（不写盘、不关 Steam）
 .\install.ps1 -AppId 1222140 -DryRun
 
 # 2) 哈希体检：确认编码没被破坏
 $b = [IO.File]::ReadAllBytes('.\install.ps1')
 'BOM={0} 非ASCII={1}' -f (($b[0] -eq 239) -and ($b[1] -eq 187)), (@($b | Where-Object { $_ -gt 127 }).Count)
-# 期望：BOM=True，非 ASCII 是一万四千多
+# 期望：BOM=True，非 ASCII 一万三千上下（少了说明中文注释被吞了）
 
 # 3) 语法检查
 $err = $null
@@ -288,13 +304,34 @@ if ($err -and $err.Count) { $err | Select-Object -First 5 | ForEach-Object { $_.
 
 # 4) 同步哈希 + 上传（顺序不能反）
 .\sync-hashes.ps1
-# 上传 bootstrap.ps1，再上传 install.ps1
+# 上传（脚本内部会做凭据自检，并按 bootstrap → install 的顺序传）
+.\publish-update.ps1
 
 # 5) 等 Pages 追平（1-2 分钟），然后真跑一次验证
 ```
 
 改 `install.ps1` 时**同时更新服务端的 INSTALL_SHA**（如果还想让 L3 保持一致）：`cd server\api-worker; .\deploy.ps1`
 
+### 8.1.1 GitHub 凭据（容易踩）
+
+凭据管理器里存着**多个 GitHub 账号的 token**（实测两个），`git credential fill` 返回哪个不由你决定。取到没权限的那个时，上传报 404，而错误信息完全看不出是账号问题。
+
+所以发布脚本用 `lib\github-cred.ps1` 按名字精确读：
+
+```powershell
+. .\lib\github-cred.ps1
+$token = Get-GithubTokenFromStore -Owner jiangqr2024
+```
+
+它读的是凭据管理器里的 `git:https://jiangqr2024@github.com`。`publish-update.ps1` 还会拿 token 查一次仓库的 `permissions.push`，不通过就直接报错——比等到每个文件都 404 要早得多。
+
+想确认当前凭据属于谁：
+
+```powershell
+& cmdkey /list | Select-String 'github'      # 看有哪些条目
+```
+
+---
 ### 8.2 发布新游戏
 
 ```powershell
