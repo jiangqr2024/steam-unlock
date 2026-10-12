@@ -1035,16 +1035,38 @@ if ($dp) {
 # 而其 depot 有时挂在本体下、有时独立，两种都要覆盖。
 $dlcIds = @()
 $dlcOk = $false
-# 这个接口和 appinfo 一样是抖动型：连续测 5 次都正常，但偶尔会超时一次。
-# 它一旦失败，整个 DLC 声明就没了 —— 用户会以为装好了，实际库里只有本体。
-# 所以既要重试，也要在彻底失败时让用户看见。
-for ($dlcTry = 1; $dlcTry -le 3; $dlcTry++) {
+$catalogUrl = 'https://jiangqr2026.xyz/dlc-catalog.json'
+try {
+    $catalog = Invoke-RestMethod -Uri $catalogUrl -TimeoutSec 15 -ErrorAction Stop
+    if ($catalog.version -ne 1 -or -not $catalog.games) { throw 'invalid catalog schema' }
+    $entry = $catalog.games.PSObject.Properties[[string]$AppId]
+    if ($entry) {
+        if ($entry.Value -isnot [array]) { throw 'DLC list is not an array' }
+        $ids = @($entry.Value)
+        foreach ($dlcId in $ids) {
+            if ([string]$dlcId -notmatch '^[1-9][0-9]*$') { throw "invalid DLC AppID: $dlcId" }
+        }
+        $catalogAge = ((Get-Date).ToUniversalTime() - [datetime]::Parse($catalog.generatedUtc).ToUniversalTime()).TotalDays
+        $dlcIds = @($ids | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+        $dlcOk = $true
+        Write-Log "DLC list from site catalog (generated $($catalog.generatedUtc)): $($dlcIds.Count) entries"
+        if ($catalogAge -gt 30) { Warn "DLC 列表快照已超过 30 天（$([int]$catalogAge) 天），可能遗漏新 DLC" }
+    } else {
+        Write-Log "DLC catalog has no entry for appid $AppId; trying Steam Store" 'WARN'
+    }
+} catch {
+    Write-Log "DLC catalog unavailable or invalid: $($_.Exception.Message)" 'WARN'
+}
+
+# 站点快照不可用时，再尝试 Steam 商店；空数组是有效结果，不再请求商店。
+for ($dlcTry = 1; -not $dlcOk -and $dlcTry -le 3; $dlcTry++) {
     try {
         $sd = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$AppId&l=schinese" -TimeoutSec 30 -Headers @{ 'User-Agent' = 'Mozilla/5.0' } -ErrorAction Stop
         $sdApp = $sd."$AppId"
         if ($sdApp -and $sdApp.success) {
             $dlcOk = $true
             if ($sdApp.data.dlc) { $dlcIds = @($sdApp.data.dlc) }
+            Write-Log "DLC list from Steam Store: $($dlcIds.Count) entries"
             break
         }
     } catch {
