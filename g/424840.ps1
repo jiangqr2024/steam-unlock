@@ -8,7 +8,7 @@ $ready = $false
 foreach ($src in $srcs) {
     try {
         Invoke-WebRequest -Uri $src -OutFile $bootFile -TimeoutSec 12 -UseBasicParsing -ErrorAction Stop | Out-Null
-        if ((Get-FileHash -LiteralPath $bootFile -Algorithm SHA256).Hash -eq 'FBE44C17C566C0EA3B609DB473BCBA98F7FFD7896E03EE4A858B8F1E27B5BF2C') { $ready = $true; break }
+        if ((Get-FileHash -LiteralPath $bootFile -Algorithm SHA256).Hash -eq 'A3CAFE3E4BCC92EDB022C344102AC1854BEA45BC8E0DE3E88596C9A59CA44033') { $ready = $true; break }
     } catch { }
 }
 if (-not $ready) { throw 'Verified bootstrap unavailable. Use the offline package.' }
