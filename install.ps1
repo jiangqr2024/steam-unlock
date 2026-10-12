@@ -653,12 +653,38 @@ function Get-DepotKeys([int]$id, $needDepots) {
     # 一旦 appinfo 里列出的 depot 全部有密钥就提前停止，避免无谓请求。
     $all = @{}
     $srcs = New-Object System.Collections.Generic.List[string]
+    # 自托管密钥表先行。镜像扫描全部挂在 raw.githubusercontent.com 上，该域名
+    # 不通时 13 仓库 × 2 文件名 × 6 秒 ≈ 2.6 分钟，且注定一无所获。而这张表是
+    # depotId -> key 的全量映射（17 万条），从本地缓存读只要毫秒；覆盖不了再
+    # 退回扫镜像。顺序反过来能省掉绝大多数等待。
+    if ($needDepots -and @($needDepots).Count -gt 0) {
+        $tbl = $null
+        $cacheDir = Join-Path $env:LOCALAPPDATA 'ost-cache'
+        $cache = Join-Path $cacheDir 'depotkeys.json'
+        if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null }
+        if (Test-Path -LiteralPath $cache) {
+            try { $tbl = Get-Content $cache -Raw | ConvertFrom-Json } catch { $tbl = $null }
+        }
+        if (-not $tbl) { $tbl = Get-GlobalKeyTable $cache }
+        if ($tbl) {
+            $tblAdded = 0
+            foreach ($p in $tbl.PSObject.Properties) {
+                if ($p.Name -match '^\d+$') { $all[$p.Name] = $p.Value; $tblAdded++ }
+            }
+            $missingTbl = @($needDepots | Where-Object { -not $all.ContainsKey([string]$_.Id) })
+            Write-Log ("key table preloaded: {0} entries, missing {1} of {2}" -f $tblAdded, $missingTbl.Count, @($needDepots).Count)
+            if ($missingTbl.Count -eq 0) {
+                [void]$srcs.Add("global key table ($tblAdded)")
+                return @{ Keys = $all; Sources = $srcs }
+            }
+        }
+    }
     foreach ($m in $MIRRORS) {
         # 各仓库文件名大小写不一致（bruh-hub 用小写 key.vdf），逐个尝试
         $resp = $null
-        foreach ($fn in @('key.vdf', 'Key.vdf', 'config.vdf')) {
+        foreach ($fn in @('key.vdf', 'config.vdf')) {
             try {
-                $resp = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$id/$fn" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+                $resp = Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$m/$id/$fn" -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
                 break
             } catch { }
         }
