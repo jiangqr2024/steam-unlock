@@ -32,7 +32,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $RAW = 'https://raw.githubusercontent.com/jiangqr2024/steam-unlock/main/install.ps1'
 
 # Expected SHA256 of install.ps1. Maintained only by sync-hashes.ps1.
-$INSTALL_SHA = '0A13220650F1F62E60A2C83DD8F79B989AEB0291B17CAC790B3048333F02B79F'
+$INSTALL_SHA = '42BB3E2BC6826B4895B3835F83C6526CBFB482B5DD2DA8130A2D109ACAFA619E'
 
 # Mirror order: direct raw first (fastest when it is fresh), then GitHub
 # proxies, then jsDelivr. raw.githubusercontent.com keeps serving the previous
