@@ -1008,11 +1008,28 @@ if ($dp) {
 # 收集 DLC。DLC 的 appid 必须显式 addappid，否则 Steam 不认为你拥有它；
 # 而其 depot 有时挂在本体下、有时独立，两种都要覆盖。
 $dlcIds = @()
-try {
-    $sd = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$AppId&l=schinese" -TimeoutSec 30 -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-    $sdApp = $sd."$AppId"
-    if ($sdApp -and $sdApp.success -and $sdApp.data.dlc) { $dlcIds = @($sdApp.data.dlc) }
-} catch { }
+$dlcOk = $false
+# 这个接口和 appinfo 一样是抖动型：连续测 5 次都正常，但偶尔会超时一次。
+# 它一旦失败，整个 DLC 声明就没了 —— 用户会以为装好了，实际库里只有本体。
+# 所以既要重试，也要在彻底失败时让用户看见。
+for ($dlcTry = 1; $dlcTry -le 3; $dlcTry++) {
+    try {
+        $sd = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$AppId&l=schinese" -TimeoutSec 30 -Headers @{ 'User-Agent' = 'Mozilla/5.0' } -ErrorAction Stop
+        $sdApp = $sd."$AppId"
+        if ($sdApp -and $sdApp.success) {
+            $dlcOk = $true
+            if ($sdApp.data.dlc) { $dlcIds = @($sdApp.data.dlc) }
+            break
+        }
+    } catch {
+        Write-Log ("dlc lookup attempt $dlcTry failed: " + $_.Exception.Message) 'WARN'
+        if ($dlcTry -lt 3) { Start-Sleep -Seconds (2 * $dlcTry) }
+    }
+}
+if (-not $dlcOk) {
+    Warn 'DLC 列表查询失败（商店接口不可达），本次配置不含 DLC'
+    Write-Log 'dlc lookup failed; continuing without dlc declarations' 'WARN'
+}
 if ($dlcIds.Count -gt 0) {
     Write-Log "dlc detected: $($dlcIds -join ', ')"
     Nice "· 检测到 $($dlcIds.Count) 个 DLC，已包含"
