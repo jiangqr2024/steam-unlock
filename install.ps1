@@ -34,7 +34,11 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 
 # ── 常量：全部硬编码，便于人工审计 ────────────────────────────────
 $REL_TAG  = '1.4.8'
-$REL_ZIP  = "https://github.com/OpenSteam001/OpenSteamTool/releases/download/$REL_TAG/OpenSteamTool-$REL_TAG-Release.zip"
+$REL_NAME = "OpenSteamTool-$REL_TAG-Release.zip"
+$REL_URLS = @(
+    "https://jiangqr2026.xyz/$REL_NAME",
+    "https://github.com/OpenSteam001/OpenSteamTool/releases/download/$REL_TAG/$REL_NAME"
+)
 $REL_SHA  = '966654604D258D5D5383E72FEC616DF7957BF86F760C67EEB3D0E18CD882C710'
 $REL_MB   = 1.11
 
@@ -149,7 +153,7 @@ function Fail ($m) { Write-Log $m 'ERROR' }
 # Retry = $true 表示"同样的命令再跑一次可能就成了"，失败出口会据此补一句重试建议。
 $script:ERRORS = @{
     'E-STEAM-NOTFOUND'  = @{ T = '没有找到 Steam。';              A = '确认电脑上装了 Steam；装在其他盘的话，把命令换成 .\install.ps1 -SteamPath "你的路径"'; R = $false }
-    'E-COMPONENT-DL'    = @{ T = '组件下载失败，网络没连上。';      A = '换个网络，或者先开代理再跑一次同样的命令。'; R = $true }
+    'E-COMPONENT-DL'    = @{ T = '组件下载失败，网络没连上。';      A = '检查网络后重试；也可以使用包含组件的离线包。'; R = $true }
     'E-COMPONENT-SUM'   = @{ T = '组件校验不通过，已主动中止。';    A = '你的文件没有被改动。这通常是下载过程中被改坏了，隔几分钟再跑一次。'; R = $true }
     'E-COMPONENT-WRITE' = @{ T = '写不进 Steam 目录。';            A = '用管理员身份重新打开 PowerShell 再跑一次。'; R = $false }
     'E-COMPONENT-BLOCK' = @{ T = '组件被安全软件拦下了。';          A = '在安全软件里把 Steam 安装目录加进"排除项"，然后重跑。'; R = $false }
@@ -337,46 +341,86 @@ function Test-LocalComponents([string]$root) {
     return $true
 }
 
-function Install-Components([string]$root, [string]$stamp) {
+function Prepare-ComponentZip([string]$root, [string]$stamp) {
     if ($DryRun) {
         Say "[DryRun] 跳过组件下载与写入（目标 $root）"
         return $true
     }
     if (Test-LocalComponents $root) {
         Ok '三个组件已存在且哈希与官方 Release 一致，跳过下载'
+        $script:COMPONENT_ARCHIVE = $null
         return $true
     }
 
-    $tmp = Join-Path $env:TEMP "ost-$REL_TAG-$stamp"
-    $zip = "$tmp.zip"
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-
     $localZip = $ComponentZip
     if (-not $localZip -and $PSScriptRoot) {
-        $bundled = Join-Path $PSScriptRoot "OpenSteamTool-$REL_TAG-Release.zip"
+        $bundled = Join-Path $PSScriptRoot $REL_NAME
         if (Test-Path -LiteralPath $bundled -PathType Leaf) { $localZip = $bundled }
     }
-    try {
-        if ($localZip) {
-            Copy-Item -LiteralPath $localZip -Destination $zip -Force -ErrorAction Stop
-            Say "使用本地组件包：$localZip"
-        } else {
-            Say "下载官方 Release（约 $REL_MB MB）: $REL_ZIP"
-            Invoke-WebRequest -Uri $REL_ZIP -OutFile $zip -UseBasicParsing -TimeoutSec 240 -ErrorAction Stop
+    if ($localZip) {
+        if (-not (Test-Path -LiteralPath $localZip -PathType Leaf)) {
+            Fail "local component archive missing: $localZip"
+            $script:ERRCODE = 'E-COMPONENT-DL'
+            return $false
         }
-    } catch {
-        Fail "download failed: $($_.Exception.Message)"
+        $h = (Get-FileHash -LiteralPath $localZip -Algorithm SHA256).Hash
+        if ($h -ne $REL_SHA) {
+            Fail "local component archive sha256 mismatch: $h"
+            $script:ERRCODE = 'E-COMPONENT-SUM'
+            return $false
+        }
+        $script:COMPONENT_ARCHIVE = $localZip
+        $script:COMPONENT_ARCHIVE_DOWNLOADED = $false
+        Say "使用已校验的本地组件包：$localZip"
+        return $true
+    }
+
+    $zip = Join-Path $env:TEMP "ost-$REL_TAG-$stamp.zip"
+    $sawMismatch = $false
+    foreach ($url in $REL_URLS) {
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            try {
+                Say "下载组件（约 $REL_MB MB）：$url；第 $attempt 次"
+                Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop | Out-Null
+                $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+                if ($h -ne $REL_SHA) {
+                    $sawMismatch = $true
+                    Fail "component archive sha256 mismatch from $url : $h"
+                    continue
+                }
+                $script:COMPONENT_ARCHIVE = $zip
+                $script:COMPONENT_ARCHIVE_DOWNLOADED = $true
+                Ok "组件包下载并校验成功：$url"
+                return $true
+            } catch {
+                Write-Log "component download failed from $url attempt $attempt : $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    $script:ERRCODE = if ($sawMismatch) { 'E-COMPONENT-SUM' } else { 'E-COMPONENT-DL' }
+    return $false
+}
+
+function Install-Components([string]$root, [string]$stamp) {
+    if ($DryRun) { return $true }
+    if (Test-LocalComponents $root) { return $true }
+    $zip = $script:COMPONENT_ARCHIVE
+    if (-not $zip -or -not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+        Fail 'verified component archive is missing'
         $script:ERRCODE = 'E-COMPONENT-DL'
         return $false
     }
-
-    $h = (Get-FileHash $zip -Algorithm SHA256).Hash
+    $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
     if ($h -ne $REL_SHA) {
-        Fail "release zip sha256 mismatch: expected $REL_SHA, got $h"
+        Fail "component archive changed after preflight: $h"
         $script:ERRCODE = 'E-COMPONENT-SUM'
         return $false
     }
-    Write-Log "release zip sha256 ok" 'OK'
+    $tmp = Join-Path $env:TEMP "ost-$REL_TAG-$stamp"
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Write-Log 'release zip sha256 ok' 'OK'
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
 
@@ -415,7 +459,7 @@ function Install-Components([string]$root, [string]$stamp) {
         Track-FileAfterWrite $root $f
     }
 
-    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    if ($script:COMPONENT_ARCHIVE_DOWNLOADED) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     Ok "三个组件已写入 $root"
     return $true
@@ -1043,12 +1087,19 @@ if ($plan.Count -lt $depots.Count) {
 if ($DryRun) {
     Warn '[DryRun] 跳过关闭 Steam'
 } else {
+    Step '· 正在下载并校验组件' 'components'
+    if (-not (Prepare-ComponentZip $steam $stamp)) {
+        $c = $script:ERRCODE
+        if (-not $c) { $c = 'E-COMPONENT-DL' }
+        Stop-WithUserMessage $c 'Prepare-ComponentZip returned false'
+        return
+    }
     Step '· 正在关闭 Steam' 'stop-steam'
     if (-not (Stop-SteamProcesses $steam)) {
         Stop-WithUserMessage 'E-STEAM-BUSY' 'Steam files stayed locked'
         return
     }
-    Step '· 正在校验组件' 'components'
+    Step '· 正在写入组件' 'components-write'
 }
 if (-not (Install-Components $steam $stamp)) {
     $c = $script:ERRCODE
