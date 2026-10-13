@@ -36,6 +36,10 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $REL_TAG  = '1.4.8'
 $REL_NAME = "OpenSteamTool-$REL_TAG-Release.zip"
 $REL_URLS = @(
+    # 顺序：jsDelivr 第一 —— 实测同一文件在 GitHub Pages 上 90 秒只拉到
+    # 65 KB，而 jsDelivr 8.8 秒完整拉完（129 KB/s）。哈希校验兜住正确性，
+    # 任何源内容不符都会被拒绝并试下一个。
+    "https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/$REL_NAME",
     "https://jiangqr2026.xyz/$REL_NAME",
     "https://github.com/OpenSteam001/OpenSteamTool/releases/download/$REL_TAG/$REL_NAME"
 )
