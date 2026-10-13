@@ -619,6 +619,11 @@ function Get-GlobalKeyTable([string]$cache) {
     $srcs = @(
         # 注意域名区别：密钥表是静态文件，放在 Pages 主域（jiangqr2026.xyz），
         # 不是服务端 API 的 api 子域 —— 两者不可混用。
+        # jsDelivr 必须在前：同一文件在 GitHub Pages 上实测只有 16-18 KB/s
+        # （7.4 MB 要跑 7 分钟，慢到用户以为卡死），jsDelivr 实测 220 KB/s
+        # （32.9 秒拉完，哈希与本地一致）。GitHub Pages 退为兜底。
+        @{ u = 'https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/depotkeys.json.gz'; g = $true; n = 'jsDelivr (gzip)' },
+        @{ u = 'https://fastly.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/depotkeys.json.gz'; g = $true; n = 'jsDelivr fastly (gzip)' },
         @{ u = 'https://jiangqr2026.xyz/depotkeys.json.gz'; g = $true;  n = 'self-hosted (gzip)' },
         @{ u = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'; g = $false; n = 'github raw' }
     )
@@ -628,7 +633,7 @@ function Get-GlobalKeyTable([string]$cache) {
         # 实测：这张表 7 MB，从自有域名下完要 4-5 分钟（国内线路限速）。
         # 但它是一次性的 —— 下完缓存 7 天，之后所有游戏都不用再下。
         # 所以超时给足，宁可慢也不要半途失败重来。
-        if ($s.g) { $ok = Download-File $s.u $raw 600 -Gzip } else { $ok = Download-File $s.u $raw 600 }
+        if ($s.g) { $ok = Download-File $s.u $raw 900 -Gzip } else { $ok = Download-File $s.u $raw 900 }
         if (-not $ok -or -not (Test-Path $raw)) {
             Write-Log ("global key table: source failed - " + $s.n) 'WARN'
             continue
