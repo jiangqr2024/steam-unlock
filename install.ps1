@@ -36,12 +36,13 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $REL_TAG  = '1.4.8'
 $REL_NAME = "OpenSteamTool-$REL_TAG-Release.zip"
 $REL_URLS = @(
-    # 顺序：jsDelivr 第一 —— 实测同一文件在 GitHub Pages 上 90 秒只拉到
-    # 65 KB，而 jsDelivr 8.8 秒完整拉完（129 KB/s）。哈希校验兜住正确性，
-    # 任何源内容不符都会被拒绝并试下一个。
-    "https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/$REL_NAME",
+    # 自有域名优先：实测 927 KB/s（7.4 MB / 8 秒）。这个数字随网络波动很大，
+    # 早前测过只有 16 KB/s —— 当时的"慢"是环境问题，不是这个源本身。
     "https://jiangqr2026.xyz/$REL_NAME",
-    "https://github.com/OpenSteam001/OpenSteamTool/releases/download/$REL_TAG/$REL_NAME"
+    "https://github.com/OpenSteam001/OpenSteamTool/releases/download/$REL_TAG/$REL_NAME",
+    # jsDelivr 只作兜底：实测小文件正常，但对 1.16 MB 起的大文件返回 404，
+    # 不能当主力。任何源内容不符都会被 SHA256 校验拒绝并试下一个。
+    "https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/$REL_NAME"
 )
 $REL_SHA  = '966654604D258D5D5383E72FEC616DF7957BF86F760C67EEB3D0E18CD882C710'
 $REL_MB   = 1.11
@@ -626,10 +627,12 @@ function Get-GlobalKeyTable([string]$cache) {
         # jsDelivr 必须在前：同一文件在 GitHub Pages 上实测只有 16-18 KB/s
         # （7.4 MB 要跑 7 分钟，慢到用户以为卡死），jsDelivr 实测 220 KB/s
         # （32.9 秒拉完，哈希与本地一致）。GitHub Pages 退为兜底。
-        @{ u = 'https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/depotkeys.json.gz'; g = $true; n = 'jsDelivr (gzip)' },
-        @{ u = 'https://fastly.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/depotkeys.json.gz'; g = $true; n = 'jsDelivr fastly (gzip)' },
+    
         @{ u = 'https://jiangqr2026.xyz/depotkeys.json.gz'; g = $true;  n = 'self-hosted (gzip)' },
-        @{ u = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'; g = $false; n = 'github raw' }
+        @{ u = 'https://raw.githubusercontent.com/SteamAutoCracks/ManifestHub/main/depotkeys.json'; g = $false; n = 'github raw' },
+        # jsDelivr 只作最后备选：实测它对 7.4 MB 的文件返回 404（小文件正常），
+        # 不能当主力。自有域名才是主源。
+        @{ u = 'https://cdn.jsdelivr.net/gh/jiangqr2024/steam-unlock@main/depotkeys.json.gz'; g = $true; n = 'jsDelivr (gzip)' }
     )
     foreach ($s in $srcs) {
         $raw = Join-Path $env:TEMP ('ost-keys-' + (Get-Random) + '.json')
