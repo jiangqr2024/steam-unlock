@@ -408,60 +408,6 @@ function Prepare-ComponentZip([string]$root, [string]$stamp) {
     return $false
 }
 
-# ── 签名补全 ────────────────────────────────────────────────────
-# Steam 每次更新都会换掉 steamclient64.dll / SteamUI.dll，组件包内置的签名
-# 随即失效 —— 表现是三个 "signature file not found" 对话框，入库功能全废。
-# 这里按当前 dll 的 SHA256 去社区镜像补签名，避免卡在"等组件发版"。
-#
-# 信任说明：签名文件是「特征码 + RVA」表。所在文件的哈希对不上时工具会跳过
-# 对应 hook（不会执行错误代码），但它仍是第三方产物，来源见 $SIG_REPO。
-$SIG_REPO = 'hazre/steam-monitor'
-
-function Complete-SteamSignatures([string]$root) {
-    if ($DryRun) { return $true }
-    $dir = Join-Path $root 'opensteamtool'
-    $bases = @(
-        "https://cdn.jsdelivr.net/gh/$SIG_REPO@main",
-        "https://raw.githubusercontent.com/$SIG_REPO/main"
-    )
-    $specs = @(
-        @{ dll = 'steamclient64.dll'; rel = 'steamclient'; kind = 'pattern' },
-        @{ dll = 'SteamUI.dll';       rel = 'steamui';     kind = 'pattern' },
-        @{ dll = 'steamclient64.dll'; rel = 'steamclient'; kind = 'ipc' }
-    )
-    $added = 0; $total = 0
-    foreach ($sp in $specs) {
-        $dllFile = Get-ChildItem -LiteralPath $root -Filter $sp.dll -File -ErrorAction SilentlyContinue |
-                   Select-Object -First 1
-        if (-not $dllFile) { continue }
-        $total++
-        $hashF = (Get-FileHash -LiteralPath $dllFile.FullName -Algorithm SHA256).Hash.ToLower()
-        $rel = "$($sp.kind)/$($sp.rel)/$hashF.toml"
-        $dst = Join-Path $dir ($rel -replace '/', '\')
-        if (Test-Path -LiteralPath $dst) { continue }
-        foreach ($bs in $bases) {
-            $tmp = "$dst.tmp"
-            if (Download-File "$bs/$rel" $tmp 30) {
-                if ((Test-Path $tmp) -and (Get-Item $tmp).Length -gt 200) {
-                    $parent = Split-Path $dst -Parent
-                    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-                    Move-Item -LiteralPath $tmp -Destination $dst -Force
-                    Write-Log ("signature completed: " + $rel)
-                    $added++
-                    break
-                }
-                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    if ($added -gt 0) {
-        Write-Log ("signatures completed for this Steam build: $added of $total")
-        Say ("  已补齐当前 Steam 版本的签名（{0} 项）" -f $added)
-    } else {
-        Write-Log ("signatures: nothing to complete ($total checked)")
-    }
-    return $true
-}
 function Install-Components([string]$root, [string]$stamp) {
     if ($DryRun) { return $true }
     if (Test-LocalComponents $root) { return $true }
@@ -1238,9 +1184,6 @@ if (-not (Install-Components $steam $stamp)) {
     Stop-WithUserMessage $c 'Install-Components returned false'
     return
 }
-# 组件里的签名可能落后于当前 Steam 版本（Steam 一更新就失效），就地补齐。
-# 失败不阻断：缺签名时工具自己会弹提示，不影响 lua 与配置写入。
-Complete-SteamSignatures $steam | Out-Null
 
 $manifestBlock = "[manifest]`nurl = `"$MANIFEST_MIRROR`""
 if ($apiInfo) {
